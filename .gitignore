@@ -28,3 +28,5 @@ htmlcov/
 # Project
 logs/
 models/
+audits/
+*.csv

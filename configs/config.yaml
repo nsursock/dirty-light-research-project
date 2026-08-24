@@ -91,8 +91,17 @@ simulation:
   low_tf: "5m"
   macro_period: 12
   num_candles: 600
-  num_symbols: 4
+  num_symbols: 5
   done_interval: 100
+
+# Default training budget (override via stage configs or CLI)
+training:
+  total_timesteps: 1000000
+  n_envs: 256
+
+evaluation:
+  episodes: 50
+  seeds: 3
 
 env:
   margin_mode: "isolated" # "isolated" (default) or "cross"

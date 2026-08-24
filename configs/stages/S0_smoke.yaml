@@ -1,0 +1,14 @@
+# S0 — Smoke / correctness
+# Purpose: Is the ML system mechanically alive? Do not judge profitability.
+# Checks: PPO/SAC updates, no NaNs, entropy, worker deadzone, positions open/close.
+
+stage:
+  name: "S0_smoke"
+
+training:
+  total_timesteps: 250000
+  n_envs: 128
+
+evaluation:
+  episodes: 10
+  seeds: 1

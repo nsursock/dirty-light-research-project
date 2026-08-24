@@ -1,0 +1,14 @@
+# S3 — Final candidate validation
+# Purpose: Only models that survive S2. Checkpoints 1M/2M/4M/6M/8M/10M.
+# Select by validation performance, not final checkpoint alone.
+
+stage:
+  name: "S3_final"
+
+training:
+  total_timesteps: 10000000
+  n_envs: 2048
+
+evaluation:
+  episodes: 500
+  seeds: 5

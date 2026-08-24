@@ -1,5 +1,6 @@
 import sys
 import time
+import random
 import argparse
 from pathlib import Path
 from tqdm import tqdm
@@ -9,19 +10,31 @@ import mlx.core as mx
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 try:
-    from scripts.config import cfg
+    from scripts.config import cfg, load_config
     from scripts.env import MultiCryptoDexPerpEnv
     from scripts.ppo import PPO
     from scripts.sac import SAC
-    from scripts.data import get_timeframe_ratio, BINANCE_TIMEFRAMES
-    from scripts.report import create_run_dir, TradeHistoryLogger, generate_breakdown_report, DEFAULT_SYMBOLS, get_symbol_name
+    from scripts.data import get_timeframe_ratio, generate_multi_tf_data
+    from scripts.report import create_run_dir, TradeHistoryLogger, generate_breakdown_report, get_symbol_name, compute_financial_metrics
+    from scripts.visualize import generate_trade_figures
 except ModuleNotFoundError:
-    from config import cfg
+    from config import cfg, load_config
     from env import MultiCryptoDexPerpEnv
     from ppo import PPO
     from sac import SAC
-    from data import get_timeframe_ratio, BINANCE_TIMEFRAMES
-    from report import create_run_dir, TradeHistoryLogger, generate_breakdown_report, DEFAULT_SYMBOLS, get_symbol_name
+    from data import get_timeframe_ratio, generate_multi_tf_data
+    from report import create_run_dir, TradeHistoryLogger, generate_breakdown_report, get_symbol_name, compute_financial_metrics
+    from visualize import generate_trade_figures
+
+VIZ_THEMES = ("synthwave", "ghibli")
+
+
+def resolve_theme(theme: str | None = None) -> str:
+    """Pick viz theme: explicit name, random, or config default."""
+    t = (theme or cfg.visualization.default_theme or "synthwave").lower()
+    if t == "random":
+        return random.choice(VIZ_THEMES)
+    return t if t in VIZ_THEMES else cfg.visualization.default_theme
 
 
 def create_agents(obs_dim: int, num_symbols: int, ppo_csv: str | None = None, sac_csv: str | None = None, sac_train_freq: int | None = None):
@@ -106,6 +119,7 @@ def train_hrl(
             worker_obs = mx.concatenate([curr_obs_norm, g_in], axis=-1)
             worker_act = sac_worker.predict(worker_obs, deterministic=False)
             next_obs, rew, done, _, info = env.step(worker_act)
+            mx.eval(next_obs, rew)
 
             macro_rews = macro_rews + rew
             step_rew = float(rew) if num_envs == 1 else float(mx.mean(rew).item())
@@ -146,70 +160,104 @@ def train_hrl(
 
 
 def evaluate_hrl(
-    ppo_manager,
-    sac_worker,
-    num_episodes: int = 5,
-    margin_mode: str = "isolated",
-    high_tf: str = "1h",
-    low_tf: str = "5m",
-    macro_period: int | None = None,
-    num_symbols: int = 4,
-    num_candles: int = 300,
-    log_dir: str | Path | None = None,
+    ppo_manager, sac_worker, num_episodes: int = 5, margin_mode: str = "isolated",
+    high_tf: str = "1h", low_tf: str = "5m", macro_period: int | None = None,
+    num_symbols: int = 4, num_candles: int = 300, eval_envs: int | None = None,
+    log_dir: str | Path | None = None, theme: str | None = None,
 ):
-    """Evaluates trained agents over test episodes and reports Martin ratio & trading metrics."""
+    """Vectorized fast evaluation of trained agents across parallel test episodes."""
+    import numpy as np
     period = macro_period or get_timeframe_ratio(high_tf, low_tf)
-    print(f"\nDiet research please... Starting Evaluation ({num_episodes} eps | {margin_mode} | {high_tf}->{low_tf})")
-    env = MultiCryptoDexPerpEnv(num_symbols=num_symbols, num_candles=num_candles, margin_mode=margin_mode, high_tf=high_tf, low_tf=low_tf)
+    theme = resolve_theme(theme)
+    print(f"\nDiet research please... Starting Vectorized Evaluation ({num_episodes} eps | {margin_mode} | {high_tf}->{low_tf} | theme={theme})")
     trade_logger = TradeHistoryLogger(Path(log_dir) / "trade_history.csv") if log_dir else None
-    results = []
-    eval_start = time.time()
-    total_eval_steps = 0
+    results, eval_start, total_eval_steps = [], time.time(), 0
+    max_batch = eval_envs or min(num_episodes, 128)
 
     with tqdm(total=num_episodes, desc="Evaluating HRL", unit="ep") as pbar:
-        for ep in range(num_episodes):
-            obs, info = env.reset(seed=42 + ep * 1000)
-            done = False
-            goal = mx.zeros((num_symbols,))
-            total_reward = 0.0
-
-            while not done:
-                total_eval_steps += 1
-                if env.t % period == 0:
-                    macro_obs = env.get_macro_obs()
-                    macro_obs_norm = (macro_obs - mx.mean(macro_obs)) / (mx.std(macro_obs) + 1e-6)
-                    goal = ppo_manager.predict(macro_obs_norm, deterministic=True)
-                obs_norm = (obs - mx.mean(obs)) / (mx.std(obs) + 1e-6)
-                worker_obs = mx.concatenate([obs_norm, goal], axis=-1)
-                action = sac_worker.predict(worker_obs, deterministic=True)
-                obs, rew, done, _, info = env.step(action)
-                total_reward += rew
-
-                if trade_logger and "trades" in info:
-                    for tr in info["trades"]:
-                        tr_dict = dict(tr)
-                        s_idx = tr_dict.pop("symbol_idx", 0)
-                        tr_dict["symbol"] = get_symbol_name(s_idx)
-                        tr_dict["strategy_id"] = f"Episode {ep + 1}"
-                        trade_logger.log_trade(tr_dict)
-
-            ret_pct = ((info["equity"] - env.initial_capital) / env.initial_capital) * 100.0
-            results.append({
-                "episode": ep + 1, "equity": info["equity"], "return_pct": ret_pct,
-                "drawdown_pct": info["drawdown"] * 100.0, "ulcer_index": info["ulcer_index"],
-                "martin_ratio": info["martin_ratio"], "liquidations": info["total_liquidations"], "trades": info["total_trades"],
-            })
-            eval_elapsed = max(time.time() - eval_start, 1e-6)
-            eval_fps = total_eval_steps / eval_elapsed
-            pbar.update(1)
-            pbar.set_postfix(
-                fps=f"{eval_fps:.1f}", ret=f"{ret_pct:+.2f}%", eq=f"{info['equity']:.2f}",
-                martin=f"{info['martin_ratio']:.2f}", max_dd=f"{info['drawdown']*100:.1f}%"
+        ep_done = 0
+        while ep_done < num_episodes:
+            b_size = min(max_batch, num_episodes - ep_done)
+            rec = (trade_logger is not None)
+            low_list, high_list = [], []
+            for i in range(b_size):
+                mx.random.seed(42 + (ep_done + i) * 1000)
+                l, h, _ = generate_multi_tf_data(num_candles=num_candles, num_symbols=num_symbols, high_tf=high_tf, low_tf=low_tf)
+                low_list.append(l)
+                high_list.append(h)
+            low_batch = mx.stack(low_list, axis=0) if b_size > 1 else low_list[0]
+            high_batch = mx.stack(high_list, axis=0) if b_size > 1 else high_list[0]
+            env = MultiCryptoDexPerpEnv(
+                num_envs=b_size, data=low_batch, high_tf_data=high_batch, num_symbols=num_symbols,
+                num_candles=num_candles, margin_mode=margin_mode, high_tf=high_tf, low_tf=low_tf, record_trades=rec
             )
-            pbar.write(f"  Ep {ep + 1:02d} | Return: {ret_pct:+6.2f}% | Final Eq: {info['equity']:8.2f} | MaxDD: {info['drawdown']*100:5.2f}% | Martin: {info['martin_ratio']:6.2f} | Liqs: {info['total_liquidations']}")
+            obs, info = env.reset()
+            goals = mx.zeros((b_size, num_symbols)) if b_size > 1 else mx.zeros((num_symbols,))
+
+            batch_trades = []
+            for t in range(num_candles - 1):
+                total_eval_steps += b_size
+                curr_obs = obs[None, :] if b_size == 1 else obs
+                c_norm = (curr_obs - mx.mean(curr_obs, axis=-1, keepdims=True)) / (mx.std(curr_obs, axis=-1, keepdims=True) + 1e-6)
+                if t % period == 0:
+                    m_obs = env.get_macro_obs()
+                    m_obs = m_obs[None, :] if b_size == 1 else m_obs
+                    m_norm = (m_obs - mx.mean(m_obs, axis=-1, keepdims=True)) / (mx.std(m_obs, axis=-1, keepdims=True) + 1e-6)
+                    g_out = ppo_manager.predict(m_norm, deterministic=True)
+                    goals = g_out[0] if b_size == 1 else g_out
+                g_in = goals[None, :] if b_size == 1 else goals
+                action = sac_worker.predict(mx.concatenate([c_norm, g_in], axis=-1), deterministic=True)
+                obs, rew, done, _, step_info = env.step(action)
+                if rec and "trades" in step_info:
+                    for tr in step_info["trades"]:
+                        tr_d = dict(tr)
+                        e_idx = tr_d.pop("env_idx", 0)
+                        tr_d["symbol"] = get_symbol_name(tr_d.pop("symbol_idx", 0))
+                        tr_d["strategy_id"] = f"Episode {ep_done + e_idx + 1}"
+                        batch_trades.append(tr_d)
+                        if trade_logger:
+                            trade_logger.log_trade(tr_d)
+                if done: break
+
+            eqs = np.array(env.equity[:, 0]) if b_size > 1 else np.array([float(env.equity[0, 0].item())])
+            peaks = np.array(env.peak_equity[:, 0]) if b_size > 1 else np.array([float(env.peak_equity[0, 0].item())])
+            ulcers = np.array(mx.sqrt(env.sum_dd_sq[:, 0] / max(env.step_cnt, 1))) if b_size > 1 else np.array([float(info["ulcer_index"])])
+
+            for i in range(b_size):
+                ep_num = ep_done + i + 1
+                ep_id = f"Episode {ep_num}"
+                sub_trades = [tr for tr in batch_trades if tr.get("strategy_id") == ep_id]
+                if sub_trades:
+                    m = compute_financial_metrics(sub_trades, initial_capital=cfg.env.initial_capital)
+                    ret_v = float(m["return_pct"].replace("%", ""))
+                    eq_v = max(0.0, cfg.env.initial_capital + float(m["net_profit"]))
+                    dd_v = float(m["max_dd"].replace("%", ""))
+                    martin_v = float(m["martin"]) if m["martin"] != "n/a" else 0.0
+                    n_trades = int(m["num_trades"])
+                else:
+                    ret_v = max(-100.0, ((float(eqs[i]) - env.initial_capital) / env.initial_capital) * 100.0)
+                    eq_v = max(0.0, float(eqs[i]))
+                    dd_v = np.maximum(0.0, (float(peaks[i]) - float(eqs[i])) / (float(peaks[i]) + 1e-8)) * 100.0
+                    martin_v = (ret_v / 100.0) / (float(ulcers[i]) + 1e-6)
+                    n_trades = int(env.total_trades if i == 0 else 0)
+
+                results.append({
+                    "episode": ep_num, "equity": eq_v, "return_pct": ret_v,
+                    "drawdown_pct": dd_v, "ulcer_index": float(ulcers[i]),
+                    "martin_ratio": martin_v, "liquidations": int(env.total_liq_count.item() if i == 0 else 0),
+                    "trades": n_trades,
+                })
+                pbar.write(f"  Ep {ep_num:02d} | Return: {ret_v:+6.2f}% | Final Eq: {eq_v:8.2f} | MaxDD: {dd_v:5.2f}% | Martin: {martin_v:6.2f}")
+
+            ep_done += b_size
+            eval_fps = total_eval_steps / max(time.time() - eval_start, 1e-6)
+            pbar.update(b_size)
+            pbar.set_postfix(fps=f"{eval_fps:.1f}", mean_ret=f"{sum(r['return_pct'] for r in results)/len(results):+.2f}%")
 
     if log_dir:
-        generate_breakdown_report(Path(log_dir) / "trade_history.csv", Path(log_dir) / "breakdown.txt", initial_capital=env.initial_capital)
+        th = Path(log_dir) / "trade_history.csv"
+        generate_breakdown_report(th, Path(log_dir) / "breakdown.txt", initial_capital=cfg.env.initial_capital)
+        generate_trade_figures(th, out_dir=log_dir, theme=theme, initial_capital=cfg.env.initial_capital)
 
     mean_ret = sum(r["return_pct"] for r in results) / len(results)
     mean_martin = sum(r["martin_ratio"] for r in results) / len(results)
@@ -221,54 +269,55 @@ def evaluate_hrl(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Multi Crypto Pure MLX Trading Bot")
-    parser.add_argument("--mode", type=str, choices=["train", "test", "full"], default="full", help="Execution mode")
-    parser.add_argument("--timesteps", "-t", type=int, default=2000, help="Training timesteps override")
-    parser.add_argument("--episodes", "-e", type=int, default=5, help="Testing episodes override")
-    parser.add_argument("--num_envs", "-n", type=int, default=2, help="Number of parallel training environments")
-    parser.add_argument("--train_scheme", type=str, choices=["joint", "alternating"], default="joint", help="Training scheme")
-    parser.add_argument("--margin_mode", type=str, choices=["isolated", "cross"], default="isolated", help="Margin mode")
-    parser.add_argument("--high_tf", type=str, default="1h", help="Binance high timeframe for PPO Manager (e.g. 1h, 4h, 1d)")
-    parser.add_argument("--low_tf", type=str, default="5m", help="Binance low timeframe for SAC Worker (e.g. 1m, 5m, 15m)")
-    parser.add_argument("--num_symbols", type=int, default=4, help="Number of crypto assets")
-    parser.add_argument("--num_candles", type=int, default=300, help="Candles per episode")
-    parser.add_argument("--macro_period", type=int, default=None, help="Macro period override (default: auto from timeframes)")
-    parser.add_argument("--train_freq", type=int, default=None, help="SAC train frequency")
-    parser.add_argument("--log_dir", type=str, default=None, help="Custom logging output directory")
-    return parser.parse_args()
+    s = cfg.simulation
+    p = argparse.ArgumentParser(description="Multi Crypto Pure MLX Trading Bot")
+    p.add_argument("--mode", choices=["train", "test", "full"], default="full")
+    p.add_argument("--stage", default=None, help="S0/S1/S2/S3 or stage YAML path (budget only)")
+    p.add_argument("--timesteps", "-t", type=int, default=None)
+    p.add_argument("--episodes", "-e", type=int, default=None)
+    p.add_argument("--num_envs", "-n", type=int, default=None)
+    p.add_argument("--eval_envs", type=int, default=None, help="Parallel evaluation envs")
+    p.add_argument("--train_scheme", choices=["joint", "alternating"], default="joint")
+    p.add_argument("--margin_mode", choices=["isolated", "cross"], default=cfg.env.margin_mode)
+    p.add_argument("--high_tf", default=s.high_tf)
+    p.add_argument("--low_tf", default=s.low_tf)
+    p.add_argument("--num_symbols", type=int, default=s.num_symbols)
+    p.add_argument("--num_candles", type=int, default=s.num_candles)
+    p.add_argument("--macro_period", type=int, default=s.get("macro_period"))
+    p.add_argument("--train_freq", type=int, default=None)
+    p.add_argument("--log_dir", default=None)
+    p.add_argument("--theme", choices=["synthwave", "ghibli", "random"], default=None)
+    return p.parse_args()
 
 
 def main():
     args = parse_args()
+    run_cfg = load_config(stage=args.stage) if args.stage else cfg
+    tr, ev = run_cfg.get("training") or {}, run_cfg.get("evaluation") or {}
+    timesteps = args.timesteps if args.timesteps is not None else int(tr.get("total_timesteps", 2000))
+    num_envs = args.num_envs if args.num_envs is not None else int(tr.get("n_envs", 2))
+    episodes = args.episodes if args.episodes is not None else int(ev.get("episodes", 5))
+    stage_name = (run_cfg.get("stage") or {}).get("name", args.stage or "base")
+    theme = resolve_theme(args.theme)
     log_dir = Path(args.log_dir) if args.log_dir else create_run_dir(base_dir="logs")
-    print(f"Diet research please... Simulation output run directory: {log_dir}")
+    print(f"Diet research please... stage={stage_name} | t={timesteps} n_envs={num_envs} eval_eps={episodes} | log={log_dir} | theme={theme}")
     ppo_manager, sac_worker = None, None
+    kw = dict(margin_mode=args.margin_mode, high_tf=args.high_tf, low_tf=args.low_tf, macro_period=args.macro_period, num_symbols=args.num_symbols, num_candles=args.num_candles)
 
     if args.mode in ("train", "full"):
-        ppo_manager, sac_worker = train_hrl(
-            total_timesteps=args.timesteps, num_envs=args.num_envs, train_scheme=args.train_scheme,
-            margin_mode=args.margin_mode, high_tf=args.high_tf, low_tf=args.low_tf,
-            macro_period=args.macro_period, num_symbols=args.num_symbols, num_candles=args.num_candles,
-            train_freq=args.train_freq, log_dir=log_dir,
-        )
-
+        ppo_manager, sac_worker = train_hrl(total_timesteps=timesteps, num_envs=num_envs, train_scheme=args.train_scheme, train_freq=args.train_freq, log_dir=log_dir, **kw)
     if args.mode in ("test", "full"):
         if ppo_manager is None or sac_worker is None:
-            sample_env = MultiCryptoDexPerpEnv(num_symbols=args.num_symbols, num_candles=args.num_candles, high_tf=args.high_tf, low_tf=args.low_tf)
-            ppo_manager, sac_worker = create_agents(sample_env.obs_dim, args.num_symbols)
-
-        evaluate_hrl(
-            ppo_manager, sac_worker, num_episodes=args.episodes, margin_mode=args.margin_mode,
-            high_tf=args.high_tf, low_tf=args.low_tf, macro_period=args.macro_period,
-            num_symbols=args.num_symbols, num_candles=args.num_candles, log_dir=log_dir,
-        )
+            env0 = MultiCryptoDexPerpEnv(num_symbols=args.num_symbols, num_candles=args.num_candles, high_tf=args.high_tf, low_tf=args.low_tf)
+            ppo_manager, sac_worker = create_agents(env0.obs_dim, args.num_symbols)
+        evaluate_hrl(ppo_manager, sac_worker, num_episodes=episodes, eval_envs=args.eval_envs, log_dir=log_dir, theme=theme, **kw)
 
     TradeHistoryLogger(log_dir / "trade_history.csv")
-    for fname in ["ppo_manager.csv", "sac_worker.csv"]:
-        fpath = log_dir / fname
-        if not fpath.exists():
-            fpath.touch()
-    generate_breakdown_report(log_dir / "trade_history.csv", log_dir / "breakdown.txt")
+    for fname in ("ppo_manager.csv", "sac_worker.csv"):
+        (log_dir / fname).touch(exist_ok=True)
+    th = log_dir / "trade_history.csv"
+    generate_breakdown_report(th, log_dir / "breakdown.txt")
+    generate_trade_figures(th, out_dir=log_dir, theme=theme, initial_capital=cfg.env.initial_capital)
 
 
 if __name__ == "__main__":

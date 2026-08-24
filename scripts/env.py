@@ -42,7 +42,8 @@ class MultiCryptoDexPerpEnv:
         self.fixed_mmr = float(maintenance_margin_rate) if maintenance_margin_rate is not None else getattr(env_cfg, "maintenance_margin_rate", None)
         self.liq_penalty, self.martin_weight = float(liquidation_penalty or getattr(env_cfg, "liquidation_penalty", 0.01)), float(martin_penalty_weight or getattr(env_cfg, "martin_penalty_weight", 5.0))
         self.bankrupt_thresh = float(getattr(env_cfg, "bankruptcy_threshold", 1e-4)) * self.initial_capital
-        self.tp_pct, self.sl_pct = (float(take_profit_pct) if take_profit_pct is not None else getattr(env_cfg, "take_profit_pct", 0.04)), (float(stop_loss_pct) if stop_loss_pct is not None else getattr(env_cfg, "stop_loss_pct", 0.02))
+        self.tp_pct = (None if (take_profit_pct is False or take_profit_pct == 0.0) else (float(take_profit_pct) if take_profit_pct is not None else getattr(env_cfg, "take_profit_pct", 0.04)))
+        self.sl_pct = (None if (stop_loss_pct is False or stop_loss_pct == 0.0) else (float(stop_loss_pct) if stop_loss_pct is not None else getattr(env_cfg, "stop_loss_pct", 0.02)))
         self.record_trades = record_trades
         self.data, self.high_tf_data = data, high_tf_data
         self.num_features = len(FEATURE_NAMES)
@@ -64,7 +65,10 @@ class MultiCryptoDexPerpEnv:
             )
 
         self.t = 0
-        self.num_candles, self.num_symbols = self.data.shape[0], self.data.shape[1]
+        if self.data.ndim == 4:
+            self.num_candles, self.num_symbols = self.data.shape[1], self.data.shape[2]
+        else:
+            self.num_candles, self.num_symbols = self.data.shape[0], self.data.shape[1]
         self.equity, self.peak_equity = mx.full((self.num_envs, 1), self.initial_capital), mx.full((self.num_envs, 1), self.initial_capital)
         self.notionals, self.positions, self.entry_prices = mx.zeros((self.num_envs, self.num_symbols)), mx.zeros((self.num_envs, self.num_symbols)), mx.zeros((self.num_envs, self.num_symbols))
         self.sum_dd_sq, self.step_cnt = mx.zeros((self.num_envs, 1)), 0
@@ -75,8 +79,11 @@ class MultiCryptoDexPerpEnv:
 
     def _get_obs(self) -> mx.array:
         t_idx = min(self.t, self.num_candles - 1)
-        market_feats = self.data[t_idx].reshape(-1)
-        m_tile = mx.tile(market_feats[None, :], (self.num_envs, 1)) if self.num_envs > 1 else market_feats[None, :]
+        if self.data.ndim == 4:
+            m_tile = self.data[:, t_idx].reshape(self.num_envs, -1)
+        else:
+            market_feats = self.data[t_idx].reshape(-1)
+            m_tile = mx.tile(market_feats[None, :], (self.num_envs, 1)) if self.num_envs > 1 else market_feats[None, :]
         norm_eq, norm_peak = self.equity / self.initial_capital, self.peak_equity / self.initial_capital
         dd = mx.maximum(mx.zeros_like(self.equity), (self.peak_equity - self.equity) / (self.peak_equity + 1e-8))
         return mx.concatenate([m_tile, self.positions, norm_eq, norm_peak, dd], axis=-1)
@@ -84,9 +91,13 @@ class MultiCryptoDexPerpEnv:
     def get_macro_obs(self) -> mx.array:
         if self.high_tf_data is None:
             return self._get_obs() if self.num_envs > 1 else self._get_obs()[0]
-        t_high = min(self.t // self.macro_period, self.high_tf_data.shape[0] - 1)
-        macro_feats = self.high_tf_data[t_high].reshape(-1)
-        m_tile = mx.tile(macro_feats[None, :], (self.num_envs, 1)) if self.num_envs > 1 else macro_feats[None, :]
+        if self.high_tf_data.ndim == 4:
+            t_high = min(self.t // self.macro_period, self.high_tf_data.shape[1] - 1)
+            m_tile = self.high_tf_data[:, t_high].reshape(self.num_envs, -1)
+        else:
+            t_high = min(self.t // self.macro_period, self.high_tf_data.shape[0] - 1)
+            macro_feats = self.high_tf_data[t_high].reshape(-1)
+            m_tile = mx.tile(macro_feats[None, :], (self.num_envs, 1)) if self.num_envs > 1 else macro_feats[None, :]
         norm_eq, norm_peak = self.equity / self.initial_capital, self.peak_equity / self.initial_capital
         dd = mx.maximum(mx.zeros_like(self.equity), (self.peak_equity - self.equity) / (self.peak_equity + 1e-8))
         obs = mx.concatenate([m_tile, self.positions, norm_eq, norm_peak, dd], axis=-1)
@@ -104,20 +115,27 @@ class MultiCryptoDexPerpEnv:
             "total_trades": int(self.total_trades), "total_tp_hits": int(self.total_tp_count.item()), "total_sl_hits": int(self.total_sl_count.item()),
         }
 
-    def _extract_trades(self, delta_n, target_n, prev_n, is_liq, is_sl, is_tp, fill_p, lev, col, mmr, net_pnl, pnl, liq_pl, liq_ps, liq_pen, fund, slip, c_close, vol, sl_exit, tp_exit, prev_eq, new_eq, tot_col, liq_occ, liq_loss):
-        d_not, t_not, p_not = np.array(delta_n[0]), np.array(target_n[0]), np.array(prev_n[0])
-        liq_sym = np.array(is_liq[0]) if self.margin_mode == "isolated" else np.array([bool(liq_occ[0, 0].item())] * self.num_symbols)
-        sl_sym, tp_sym = np.array(is_sl[0]), np.array(is_tp[0])
-        traded = (np.abs(d_not) > 1.0) | liq_sym | sl_sym | tp_sym | ((np.abs(p_not) > 1.0) & (np.abs(t_not) <= 1.0))
+    def _extract_trades(self, delta_n, target_n, prev_n, is_liq, is_sl, is_tp, fill_p, lev, col, mmr, net_pnl, pnl, liq_pl, liq_ps, liq_pen, fund, slip, c_close, vol, sl_exit, tp_exit, prev_eq, new_eq, tot_col, liq_occ, liq_loss, env_idx: int = 0):
+        d_not, t_not, p_not = np.array(delta_n[env_idx]), np.array(target_n[env_idx]), np.array(prev_n[env_idx])
+        liq_sym = np.array(is_liq[env_idx]) if self.margin_mode == "isolated" else np.array([bool(liq_occ[env_idx, 0].item())] * self.num_symbols)
+        sl_sym, tp_sym = np.array(is_sl[env_idx]), np.array(is_tp[env_idx])
+        is_new = (np.abs(p_not) <= 1.0) & (np.abs(t_not) > 1.0)
+        is_close = (np.abs(p_not) > 1.0) & (np.abs(t_not) <= 1.0)
+        is_flip = (np.sign(p_not) != np.sign(t_not)) & (np.abs(p_not) > 1.0) & (np.abs(t_not) > 1.0)
+        traded = is_new | is_close | is_flip | liq_sym | sl_sym | tp_sym
         active = np.where(traded)[0]
         if len(active) == 0: return []
-        fill_a, lev_a, col_a, mmr_a = np.array(fill_p[0]), np.array(lev[0]), np.array(col[0]), np.array(mmr[0])
-        np_a, gp_a = np.array(net_pnl[0]), np.array(pnl[0])
-        liq_la, liq_sa = np.array(liq_pl[0]), np.array(liq_ps[0])
-        liq_pena = np.array(liq_pen[0]) if self.margin_mode == "isolated" and liq_pen is not None else None
-        fund_a, slip_a, cc_a, vol_a = np.array(fund), np.array(slip[0]), np.array(c_close), np.array(vol)
-        sl_ex_a, tp_ex_a = np.array(sl_exit[0]), np.array(tp_exit[0])
-        peq_v, neq_v, tc_v = float(prev_eq[0, 0].item()), float(new_eq[0, 0].item()), float(tot_col[0, 0].item())
+        fill_a, lev_a, col_a, mmr_a = np.array(fill_p[env_idx]), np.array(lev[env_idx]), np.array(col[env_idx]), np.array(mmr[env_idx])
+        np_a, gp_a = np.array(net_pnl[env_idx]), np.array(pnl[env_idx])
+        liq_la, liq_sa = np.array(liq_pl[env_idx]), np.array(liq_ps[env_idx])
+        liq_pena = np.array(liq_pen[env_idx]) if self.margin_mode == "isolated" and liq_pen is not None else None
+        fund_a = np.array(fund[env_idx] if hasattr(fund, "ndim") and fund.ndim > 1 else fund)
+        slip_a = np.array(slip[env_idx] if hasattr(slip, "ndim") and slip.ndim > 1 else slip)
+        cc_a = np.array(c_close[env_idx] if hasattr(c_close, "ndim") and c_close.ndim > 1 else c_close)
+        vol_a = np.array(vol[env_idx] if hasattr(vol, "ndim") and vol.ndim > 1 else vol)
+        sl_ex_a = np.array(sl_exit[env_idx] if hasattr(sl_exit, "ndim") and sl_exit.ndim > 1 else sl_exit)
+        tp_ex_a = np.array(tp_exit[env_idx] if hasattr(tp_exit, "ndim") and tp_exit.ndim > 1 else tp_exit)
+        peq_v, neq_v, tc_v = float(prev_eq[env_idx, 0].item()), float(new_eq[env_idx, 0].item()), float(tot_col[env_idx, 0].item())
         records = []
         for s in active:
             dn, tn, pn = float(d_not[s]), float(t_not[s]), float(p_not[s])
@@ -130,22 +148,22 @@ class MultiCryptoDexPerpEnv:
             elif abs(pn) <= 1.0 and abs(tn) > 1.0: et, pe = "open", "open"
             else: et, pe = "market_close", ("increase" if abs(tn) > abs(pn) else "reduce")
             s_lev, s_col = float(lev_a[s]), float(col_a[s])
-            s_p = float(sl_ex_a[s]) if is_s else (float(tp_ex_a[s]) if is_t else float(fill_a[s]))
+            s_p = float(fill_a[s]) if pe in ("open", "increase") else (float(sl_ex_a[s]) if is_s else (float(tp_ex_a[s]) if is_t else float(fill_a[s])))
             s_not, s_mmr = (abs(dn) if abs(dn) > 1.0 else abs(pn)), float(mmr_a[s])
-            s_np = -s_col if is_l else float(np_a[s])
-            s_gp = -s_col if is_l else float(gp_a[s])
+            s_np = -s_col if is_l else max(-s_col, float(np_a[s]))
+            s_gp = -s_col if is_l else max(-s_col, float(gp_a[s]))
             lp = float(liq_la[s] if tn > 0 else (liq_sa[s] if tn < 0 else 0.0))
             dist_liq = max(0.0, (s_p - lp) / s_p * 100.0) if tn > 0 else (max(0.0, (lp - s_p) / s_p * 100.0) if tn < 0 else 100.0)
             lf = float(liq_pena[s]) if (self.margin_mode == "isolated" and is_l) else (float(liq_loss[0, 0].item()) if (self.margin_mode == "cross" and bool(liq_occ[0, 0].item())) else 0.0)
             records.append({
-                "symbol_idx": int(s), "side": side, "position_effect": pe, "exit_type": et,
+                "env_idx": int(env_idx), "symbol_idx": int(s), "side": side, "position_effect": pe, "exit_type": et,
                 "quantity": s_not / (s_p + 1e-8), "filled_quantity": s_not / (s_p + 1e-8), "price": s_p, "notional_value": s_not,
                 "leverage": s_lev, "fee_amount": float(self.fee_rate * abs(dn)), "funding_fee": float(tn * fund_a[s]),
                 "slippage_bps": (float(slip_a[s] * abs(dn)) / (abs(dn) + 1e-8)) * 10000.0 if abs(dn) > 1e-4 else 0.0,
                 "liquidation_fee": lf, "liquidation_penalty": self.liq_penalty if is_l else 0.0,
                 "realized_pnl": s_np if pe in ("close", "reduce") else 0.0, "unrealized_pnl": s_np if pe in ("open", "increase") else 0.0,
-                "gross_pnl": s_gp, "net_pnl": s_np, "pnl_pct": (s_np / (s_col + 1e-8)) * 100.0,
-                "return_on_margin": s_np / (s_col + 1e-8), "return_on_equity": s_np / (peq_v + 1e-8),
+                "gross_pnl": s_gp, "net_pnl": s_np, "pnl_pct": max(-100.0, (s_np / (s_col + 1e-8)) * 100.0),
+                "return_on_margin": max(-1.0, s_np / (s_col + 1e-8)), "return_on_equity": s_np / (peq_v + 1e-8),
                 "margin_type": self.margin_mode, "initial_margin": s_col, "maintenance_margin": abs(tn) * s_mmr, "margin_used": s_col, "free_margin": max(0.0, peq_v - tc_v),
                 "liquidation_price": lp, "distance_to_liquidation_pct": dist_liq, "equity_before": peq_v, "equity_after": neq_v,
                 "mark_price": float(cc_a[s]), "index_price": float(cc_a[s]), "oracle_price": float(cc_a[s]),
@@ -180,7 +198,10 @@ class MultiCryptoDexPerpEnv:
 
         # 2. Pessimistic Low-TF Fills & Costs
         t_idx = min(self.t, self.num_candles - 1)
-        c_open, c_high, c_low, c_close, vol, funding_rate = self.data[t_idx, :, 0], self.data[t_idx, :, 1], self.data[t_idx, :, 2], self.data[t_idx, :, 3], self.data[t_idx, :, 4], self.data[t_idx, :, 5]
+        if self.data.ndim == 4:
+            c_open, c_high, c_low, c_close, vol, funding_rate = self.data[:, t_idx, :, 0], self.data[:, t_idx, :, 1], self.data[:, t_idx, :, 2], self.data[:, t_idx, :, 3], self.data[:, t_idx, :, 4], self.data[:, t_idx, :, 5]
+        else:
+            c_open, c_high, c_low, c_close, vol, funding_rate = self.data[t_idx, :, 0], self.data[t_idx, :, 1], self.data[t_idx, :, 2], self.data[t_idx, :, 3], self.data[t_idx, :, 4], self.data[t_idx, :, 5]
         prev_notionals, delta_notional = self.notionals, target_notional - self.notionals
         abs_delta = mx.abs(delta_notional)
         pool_liq = mx.maximum(vol * c_close, 1e4)
@@ -204,10 +225,10 @@ class MultiCryptoDexPerpEnv:
         if next_t >= self.num_candles:
             done, n_open, n_high, n_low, n_close, n_funding = True, c_close, c_close, c_close, c_close, funding_rate
         else:
-            n_candle = self.data[next_t]
-            n_open, n_high, n_low, n_close, n_funding = n_candle[:, 0], n_candle[:, 1], n_candle[:, 2], n_candle[:, 3], n_candle[:, 5]
+            n_candle = self.data[:, next_t] if self.data.ndim == 4 else self.data[next_t]
+            n_open, n_high, n_low, n_close, n_funding = n_candle[..., 0], n_candle[..., 1], n_candle[..., 2], n_candle[..., 3], n_candle[..., 5]
 
-        # 4. Pessimistic Low-TF Liq, SL, TP Evaluation (Liq > SL > TP > Hold)
+        # 4. Pessimistic Low-TF Liq, SL, TP Evaluation (SL > Liq > TP > Hold)
         mmr_sym = mx.full(leverage.shape, self.fixed_mmr) if self.fixed_mmr is not None else (1.0 / (2.0 * mx.maximum(leverage, 1.0)))
         is_long, is_short = target_notional > 1e-4, target_notional < -1e-4
         liq_p_long = self.entry_prices * (1.0 - (1.0 / mx.maximum(leverage, 1.0)) + mmr_sym)
@@ -224,9 +245,11 @@ class MultiCryptoDexPerpEnv:
         tp_p_short = self.entry_prices * (1.0 - tp_dist) if tp_enabled else mx.zeros_like(self.entry_prices)
         hit_tp = is_active & ((is_long & (n_high >= tp_p_long)) | (is_short & (n_low <= tp_p_short))) if tp_enabled else mx.zeros_like(is_active)
 
-        is_liq_sym, is_sl_sym = hit_liq, hit_sl & (~hit_liq)
-        is_tp_sym = hit_tp & (~hit_liq) & (~is_sl_sym)
-        is_hold_sym = is_active & (~hit_liq) & (~is_sl_sym) & (~is_tp_sym)
+        # On adverse price movement, stop-loss is reached before liquidation price
+        is_sl_sym = hit_sl
+        is_liq_sym = hit_liq & (~is_sl_sym)
+        is_tp_sym = hit_tp & (~is_sl_sym) & (~is_liq_sym)
+        is_hold_sym = is_active & (~is_sl_sym) & (~is_liq_sym) & (~is_tp_sym)
         sl_exit = mx.where(is_long, mx.minimum(sl_p_long, n_open), mx.maximum(sl_p_short, n_open))
         tp_exit = mx.where(is_long, tp_p_long, tp_p_short)
         exit_p = mx.where(is_sl_sym, sl_exit, mx.where(is_tp_sym, tp_exit, n_close))
@@ -234,7 +257,7 @@ class MultiCryptoDexPerpEnv:
         pnl_sym = mx.abs(target_notional) * step_ret - (target_notional * n_funding)
         sum_act_notional = mx.sum(mx.abs(target_notional), axis=-1, keepdims=True)
         step_costs = (fee_cost + slippage_cost) * (mx.abs(target_notional) / (sum_act_notional + 1e-8))
-        net_sym_pnl = pnl_sym - step_costs
+        net_sym_pnl = mx.maximum(-collateral, pnl_sym - step_costs)
 
         # 5. Margin Settlement & Liq Penalties
         if self.margin_mode == "cross":
@@ -254,9 +277,9 @@ class MultiCryptoDexPerpEnv:
             self.total_tp_count = self.total_tp_count + mx.sum(is_tp_sym.astype(mx.int32))
             self.notionals = mx.where(cross_liq, mx.zeros_like(self.notionals), mx.where(is_hold_sym, target_notional, mx.zeros_like(target_notional)))
             self.entry_prices = mx.where(cross_liq, mx.zeros_like(self.entry_prices), mx.where(is_hold_sym, self.entry_prices, mx.zeros_like(self.entry_prices)))
-        else:  # Isolated
+        else:  # Isolated: max trade loss is strictly capped at collateral
             liq_penalties = mx.abs(target_notional) * self.liq_penalty
-            eq_deltas = mx.where(is_liq_sym, -(collateral + liq_penalties), net_sym_pnl)
+            eq_deltas = mx.where(is_liq_sym, -collateral, net_sym_pnl)
             new_equity = mx.maximum(mx.zeros_like(self.equity), self.equity + mx.sum(eq_deltas, axis=-1, keepdims=True))
             liq_occurred = mx.any(is_liq_sym, axis=-1, keepdims=True)
             self.total_liq_count = self.total_liq_count + mx.sum(is_liq_sym.astype(mx.int32))
@@ -279,7 +302,12 @@ class MultiCryptoDexPerpEnv:
 
         info = {}
         if self.record_trades or self.num_envs == 1:
-            trade_records = self._extract_trades(delta_notional, target_notional, prev_notionals, is_liq_sym, is_sl_sym, is_tp_sym, pessimistic_fill, leverage, collateral, mmr_sym, net_sym_pnl, pnl_sym, liq_p_long, liq_p_short, liq_penalties if self.margin_mode == "isolated" else None, funding_rate, slippage_rate, c_close, vol, sl_exit, tp_exit, prev_equity, new_equity, tot_col, liq_occurred, liq_loss if self.margin_mode == "cross" else None)
+            trade_records = []
+            if self.record_trades and self.num_envs > 1:
+                for e in range(self.num_envs):
+                    trade_records.extend(self._extract_trades(delta_notional, target_notional, prev_notionals, is_liq_sym, is_sl_sym, is_tp_sym, pessimistic_fill, leverage, collateral, mmr_sym, net_sym_pnl, pnl_sym, liq_p_long, liq_p_short, liq_penalties if self.margin_mode == "isolated" else None, funding_rate, slippage_rate, c_close, vol, sl_exit, tp_exit, prev_equity, new_equity, tot_col, liq_occurred, liq_loss if self.margin_mode == "cross" else None, env_idx=e))
+            else:
+                trade_records = self._extract_trades(delta_notional, target_notional, prev_notionals, is_liq_sym, is_sl_sym, is_tp_sym, pessimistic_fill, leverage, collateral, mmr_sym, net_sym_pnl, pnl_sym, liq_p_long, liq_p_short, liq_penalties if self.margin_mode == "isolated" else None, funding_rate, slippage_rate, c_close, vol, sl_exit, tp_exit, prev_equity, new_equity, tot_col, liq_occurred, liq_loss if self.margin_mode == "cross" else None, env_idx=0)
             self.total_trades += len(trade_records)
             info = self._get_info()
             info.update({"liquidated": bool(liq_occurred[0, 0].item()), "net_pnl": float((self.equity[0, 0] - prev_equity[0, 0]).item()), "costs": float(total_costs[0, 0].item()), "trades": trade_records, "total_trades": int(self.total_trades)})

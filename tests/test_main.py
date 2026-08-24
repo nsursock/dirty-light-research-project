@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.main import create_agents, train_hrl, evaluate_hrl, parse_args, main
 from scripts.report import create_run_dir, TradeHistoryLogger, generate_breakdown_report, TRADE_HISTORY_COLUMNS
+from scripts.visualize import generate_trade_figures
 
 
 def test_create_agents():
@@ -115,11 +116,15 @@ def test_simulation_run_dir_and_files(tmp_path, monkeypatch):
     sac_file = run_dir / "sac_worker.csv"
     trade_file = run_dir / "trade_history.csv"
     breakdown_file = run_dir / "breakdown.txt"
+    perf_fig = run_dir / "trade_performance_synthwave.png"
+    dist_fig = run_dir / "trade_distributions_synthwave.png"
 
     assert ppo_file.exists(), "ppo_manager.csv must exist in run dir"
     assert sac_file.exists(), "sac_worker.csv must exist in run dir"
     assert trade_file.exists(), "trade_history.csv must exist in run dir"
     assert breakdown_file.exists(), "breakdown.txt must exist in run dir"
+    assert perf_fig.exists() and perf_fig.stat().st_size > 0, "trade performance 2x2 figure required after breakdown"
+    assert dist_fig.exists() and dist_fig.stat().st_size > 0, "trade distributions 2x2 figure required after breakdown"
 
     with open(trade_file, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
@@ -156,6 +161,21 @@ def test_breakdown_report_with_empty_and_custom_trades(tmp_path):
     assert "Episode 1" in report_single
     assert "Portfolio" in report_single
     assert "+150.00" in report_single
+
+
+@pytest.mark.parametrize("theme", ["synthwave", "ghibli"])
+def test_trade_figures_after_breakdown(tmp_path, theme):
+    csv_path = tmp_path / "trade_history.csv"
+    logger = TradeHistoryLogger(csv_path)
+    logger.log_trade({"symbol": "BTC", "side": "long", "position_effect": "close", "exit_type": "take_profit",
+                      "net_pnl": 100.0, "leverage": 10, "margin_used": 200})
+    logger.log_trade({"symbol": "ETH", "side": "short", "position_effect": "close", "exit_type": "stop_loss",
+                      "net_pnl": -50.0, "leverage": 25, "margin_used": 80})
+    generate_breakdown_report(csv_path, tmp_path / "breakdown.txt")
+    perf, dist = generate_trade_figures(csv_path, out_dir=tmp_path, theme=theme, initial_capital=10000.0)
+    assert perf.exists() and perf.stat().st_size > 1000
+    assert dist.exists() and dist.stat().st_size > 1000
+    assert theme in perf.name and theme in dist.name
 
 
 @pytest.mark.parametrize("high_tf,low_tf", [

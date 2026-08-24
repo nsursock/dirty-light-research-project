@@ -56,9 +56,24 @@ docs/       Architecture and research notes
 
 ## Configuration
 
-All hyperparameters live in [`configs/config.yaml`](configs/config.yaml):
+Base hyperparameters live in [`configs/config.yaml`](configs/config.yaml):
 data generation, agent hyperparameters, simulation, environment (margin,
 leverage, risk), and visualization settings.
+
+**Training stages** (budget only; env/data stay fixed) live in `configs/stages/`:
+
+| Stage | Purpose | Timesteps | Envs | Eval eps | Seeds |
+|-------|---------|----------:|-----:|---------:|------:|
+| S0 smoke | correctness | 250k | 64 | 10 | 1 |
+| S1 baseline | learning sanity | 1M | 256 | 50 | 3 |
+| S2 research | comparison | 5M | 256 | 100 | 3 |
+| S3 final | validation | 10M | 256 | 500 | 5 |
+
+```bash
+python scripts/main.py --stage S0 --mode full
+python scripts/main.py --stage S1 --mode train
+python scripts/main.py --stage configs/stages/S2_research.yaml -t 100000  # CLI still overrides
+```
 
 ## Tests
 

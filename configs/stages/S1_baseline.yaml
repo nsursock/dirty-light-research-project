@@ -1,0 +1,14 @@
+# S1 — Baseline learning
+# Purpose: First meaningful training run. Checkpoints ~250k/500k/750k/1M.
+# Evaluate all checkpoints on the same frozen evaluation dataset.
+
+stage:
+  name: "S1_baseline"
+
+training:
+  total_timesteps: 1000000
+  n_envs: 256
+
+evaluation:
+  episodes: 50
+  seeds: 3

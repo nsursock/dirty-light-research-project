@@ -109,7 +109,7 @@ def test_pessimistic_fills_buy_and_sell():
     candle_1 = [100.0, 105.0, 95.0, 100.0, 1000.0, 0.0] + [0.0] * (len(FEATURE_NAMES) - 6)
     custom_data = mx.array([[candle_0, candle_0], [candle_1, candle_1]])
 
-    env = MultiCryptoDexPerpEnv(data=custom_data, num_symbols=2, num_candles=2, slippage_coef=0.001)
+    env = MultiCryptoDexPerpEnv(data=custom_data, num_symbols=2, num_candles=2, slippage_coef=0.001, stop_loss_pct=0.0, take_profit_pct=0.0)
     env.reset()
 
     # Symbol 0 buys (+1.0), Symbol 1 sells (-1.0)
@@ -136,7 +136,7 @@ def test_low_tf_liquidation_on_bar_extremes():
 
     env = MultiCryptoDexPerpEnv(
         data=custom_data, num_symbols=1, num_candles=2,
-        min_leverage=10.0, max_leverage=10.0, maintenance_margin_rate=0.05,
+        min_leverage=10.0, max_leverage=10.0, maintenance_margin_rate=0.05, stop_loss_pct=0.0,
     )
     env.reset()
     _, _, _, _, info = env.step(mx.array([1.0]))

@@ -1,0 +1,15 @@
+# S2 — Research (main experimental stage)
+# Purpose: Serious comparison. Checkpoints 0.5M/1M/2M/3M/4M/5M.
+# Decision point: if no OOS improvement by 5M, investigate before S3.
+# ~417k manager decisions at macro_period=12.
+
+stage:
+  name: "S2_research"
+
+training:
+  total_timesteps: 5000000
+  n_envs: 1024
+
+evaluation:
+  episodes: 100
+  seeds: 3

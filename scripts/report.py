@@ -125,7 +125,7 @@ def compute_financial_metrics(trades: list[dict], initial_capital: float = 10000
     wins = [p for p in pnls if p > 1e-8]
     losses = [p for p in pnls if p < -1e-8]
     net_profit = sum(pnls)
-    return_pct = (net_profit / initial_capital) * 100.0
+    return_pct = max(-100.0, (net_profit / initial_capital) * 100.0)
 
     win_rate = f"{(len(wins) / num_trades) * 100.0:.2f}%"
     avg_win = f"{sum(wins) / len(wins):+.2f}" if wins else "n/a"
@@ -138,12 +138,12 @@ def compute_financial_metrics(trades: list[dict], initial_capital: float = 10000
     dds, rets = [], []
     for p in pnls:
         rets.append(p / (eq + 1e-8))
-        eq += p
+        eq = max(0.0, eq + p)
         if eq > peak:
             peak = eq
-        dds.append(max(0.0, (peak - eq) / (peak + 1e-8)))
+        dds.append(min(1.0, max(0.0, (peak - eq) / (peak + 1e-8))))
 
-    max_dd = max(dds) if dds else 0.0
+    max_dd = min(1.0, max(dds)) if dds else 0.0
     ulcer = (sum(d ** 2 for d in dds) / max(len(dds), 1)) ** 0.5
 
     mean_ret = sum(rets) / max(len(rets), 1)
@@ -192,14 +192,14 @@ def collateral_bucket(v: float) -> str:
     if v < 50:
         return "pocket (<$50)"
     if v < 200:
-        return "small ($50-$200)"
+        return "small ($50-200)"
     if v < 1000:
-        return "standard ($200-$1k)"
-    return "loaded (>=$1k)"
+        return "standard ($200-1k)"
+    return "loaded ($1k+)"
 
 
 COLLATERAL_BUCKET_ORDER = [
-    "pocket (<$50)", "small ($50-$200)", "standard ($200-$1k)", "loaded (>=$1k)",
+    "pocket (<$50)", "small ($50-200)", "standard ($200-1k)", "loaded ($1k+)",
 ]
 
 
@@ -213,32 +213,38 @@ SIDE_BUCKET_ORDER = ["bull (long)", "bear (short)"]
 
 
 def exit_type_bucket(t: dict) -> str:
-    """Infers exit type from trade record attributes."""
+    """Infers exit type from trade record attributes for closed trades."""
     ext = str(t.get("exit_type", "")).lower()
     if ext in EXIT_TYPE_BUCKET_ORDER:
         return ext
     if float(t.get("liquidation_fee", 0.0) or 0.0) > 0:
         return "liquidation"
-    pos_eff = str(t.get("position_effect", "")).lower()
-    if pos_eff == "open":
-        return "open"
     pnl = float(t.get("net_pnl", 0.0) or 0.0)
-    if pos_eff in ("close", "reduce"):
+    pos_eff = str(t.get("position_effect", "")).lower()
+    if pos_eff in ("close", "reduce", ""):
         return "take_profit" if pnl > 1e-8 else ("stop_loss" if pnl < -1e-8 else "market_close")
     return "market_close"
 
 
-EXIT_TYPE_BUCKET_ORDER = ["take_profit", "stop_loss", "market_close", "liquidation", "open"]
+EXIT_TYPE_BUCKET_ORDER = ["take_profit", "stop_loss", "market_close", "liquidation"]
 
 
 def generate_breakdown_report(trade_history_path: str | Path, output_path: str | Path | None = None, initial_capital: float = 10000.0) -> str:
-    """Produces a formatted breakdown.txt summary per symbol and per episode with portfolio totals."""
+    """Produces a formatted breakdown.txt summary per symbol and per episode with portfolio totals (closed trades only)."""
     csv_file = Path(trade_history_path)
     trades = []
     if csv_file.exists() and csv_file.stat().st_size > 0:
         with open(csv_file, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            trades = list(reader)
+            raw_trades = list(reader)
+            trades = [
+                t for t in raw_trades
+                if str(t.get("position_effect", "")).lower() in ("close", "reduce")
+                or str(t.get("exit_type", "")).lower() in ("take_profit", "stop_loss", "market_close", "liquidation")
+            ]
+            if not trades and raw_trades:
+                trades = [t for t in raw_trades if str(t.get("position_effect", "")).lower() != "open" and str(t.get("exit_type", "")).lower() != "open"]
+                trades = trades or raw_trades
 
     port_m = compute_financial_metrics(trades, initial_capital)
 
@@ -252,11 +258,16 @@ def generate_breakdown_report(trade_history_path: str | Path, output_path: str |
         return rows
 
     # 1. Per Symbol Breakdown
-    symbols = sorted(list(set(t.get("symbol", "UNKNOWN") for t in trades))) if trades else []
+    def _sym_sort_key(s):
+        return DEFAULT_SYMBOLS.index(s) if s in DEFAULT_SYMBOLS else 999
+    symbols = sorted(list(set(t.get("symbol", "UNKNOWN") for t in trades)), key=_sym_sort_key) if trades else []
     sym_rows = make_table_rows(symbols, lambda t: t.get("symbol", "UNKNOWN"))
 
-    # 2. Per Episode Breakdown
-    episodes = sorted(list(set(t.get("strategy_id", "Episode 1") for t in trades))) if trades else []
+    # 2. Per Episode Breakdown (Natural numerical sorting e.g. Episode 1, 2, ... 10)
+    def _natural_key(s):
+        import re
+        return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', str(s))]
+    episodes = sorted(list(set(t.get("strategy_id", "Episode 1") for t in trades)), key=_natural_key) if trades else []
     ep_rows = make_table_rows(episodes, lambda t: t.get("strategy_id", "Episode 1"))
 
     # 3. Per Leverage Breakdown

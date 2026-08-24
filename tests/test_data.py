@@ -45,6 +45,7 @@ def test_config_loading():
     loaded_cfg = load_config()
     assert loaded_cfg.data.num_candles > 0
     assert loaded_cfg.data.num_symbols > 0
+    assert loaded_cfg.data.num_symbols == loaded_cfg.simulation.num_symbols
     assert len(loaded_cfg.data.regimes.names) == 5
     assert len(loaded_cfg.data.regimes.mu) == 5
     assert len(loaded_cfg.data.regimes.sigma) == 5
@@ -52,6 +53,26 @@ def test_config_loading():
     assert len(loaded_cfg.data.features) == 19
     assert loaded_cfg.agents.ppo.learning_rate > 0.0
     assert loaded_cfg.agents.sac.learning_rate > 0.0
+    assert loaded_cfg.training.total_timesteps > 0
+    assert loaded_cfg.evaluation.episodes > 0
+
+
+def test_stage_config_merge():
+    """Stages override training budget only; env/data/simulation stay identical."""
+    base = load_config()
+    s0 = load_config(stage="S0")
+    s1 = load_config(stage="S1_baseline")
+    s2 = load_config(stage="S2")
+    s3 = load_config(stage="S3_final")
+    assert s0.stage.name == "S0_smoke"
+    assert s0.training.total_timesteps == 250_000 and s0.training.n_envs == 128
+    assert s1.training.total_timesteps == 1_000_000 and s1.evaluation.episodes == 50
+    assert s2.training.total_timesteps == 5_000_000 and s2.training.n_envs == 1024
+    assert s3.training.total_timesteps == 10_000_000 and s3.training.n_envs == 2048
+    for st in (s0, s1, s2, s3):
+        assert st.simulation.num_symbols == base.simulation.num_symbols
+        assert st.env.max_leverage == base.env.max_leverage
+        assert st.agents.ppo.learning_rate == base.agents.ppo.learning_rate
 
 
 # -----------------------------------------------------------------------------
