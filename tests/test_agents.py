@@ -251,3 +251,36 @@ def test_save_and_load(tmp_path):
     sac2.load(sac_path)
     s_act2 = sac2.predict(obs_s, deterministic=True)
     assert mx.allclose(s_act1, s_act2).item(), "SAC loaded weights must match saved weights"
+
+
+def test_decode_macro_goals_and_alignment():
+    """Validates discrete manager goal decoding and semantic worker goal alignment."""
+    from scripts.agents import decode_macro_goals, compute_goal_alignment
+
+    # 2 symbols, 5 goal dims each:
+    # Sym 0: side=0.8 (Long), lev=0.0, risk=0.9 (High/Aggressive), tp=0.5 (Swing), sl=0.0
+    # Sym 1: side=-0.8 (Short), lev=0.0, risk=-0.8 (Low/Conservative), tp=-0.5 (Scalp), sl=0.0
+    raw_goals = mx.array([
+        [0.8, 0.0, 0.9, 0.5, 0.0, -0.8, 0.0, -0.8, -0.5, 0.0]
+    ])
+    side, exposure_tier, regime = decode_macro_goals(raw_goals, num_symbols=2)
+    assert side[0, 0].item() == 1.0   # Long
+    assert side[0, 1].item() == -1.0  # Short
+    assert exposure_tier[0, 0].item() == 2.0  # High
+    assert exposure_tier[0, 1].item() == 0.0  # Low
+    assert regime[0, 0].item() == 1.0   # Swing
+    assert regime[0, 1].item() == -1.0  # Scalp
+
+    # Perfectly aligned worker action
+    aligned_worker_act = mx.array([
+        [1.0, 0.0, 0.6, 1.0, 0.0, -1.0, 0.0, -0.6, -1.0, 0.0]
+    ])
+    align_score = compute_goal_alignment(aligned_worker_act, raw_goals, num_symbols=2)
+    assert float(align_score.item()) > 0.5
+
+    # Opposing worker action (opposite side)
+    opposing_worker_act = mx.array([
+        [-1.0, 0.0, -0.6, -1.0, 0.0, 1.0, 0.0, 0.6, 1.0, 0.0]
+    ])
+    opp_score = compute_goal_alignment(opposing_worker_act, raw_goals, num_symbols=2)
+    assert float(opp_score.item()) < 0.0

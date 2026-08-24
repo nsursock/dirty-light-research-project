@@ -128,10 +128,21 @@ class PPO:
         return act[0] if is_single else act
 
     def compute_gae(self, rewards, values, dones, next_val):
-        T = rewards.shape[0]
+        if rewards.ndim == 1:
+            rewards = rewards[:, None]
+            values = values[:, None]
+            dones = dones[:, None]
+            val_next = next_val.reshape(1) if isinstance(next_val, mx.array) else mx.array([float(next_val)])
+        else:
+            val_next = next_val if isinstance(next_val, mx.array) else mx.full((rewards.shape[1],), float(next_val))
+            if val_next.ndim == 0:
+                val_next = mx.full((rewards.shape[1],), float(val_next.item()))
+            elif val_next.ndim == 2:
+                val_next = val_next.squeeze(-1)
+
+        T, B = rewards.shape
         advs = [None] * T
-        gae = mx.zeros_like(rewards[0])
-        val_next = next_val
+        gae = mx.zeros((B,), dtype=mx.float32)
         for t in reversed(range(T)):
             mask = 1.0 - dones[t]
             delta = rewards[t] + self.gamma * val_next * mask - values[t]
@@ -143,11 +154,18 @@ class PPO:
         return advs, returns
 
     def train_on_rollout(self, obs, actions, rewards, dones, values, log_probs, next_val, ep_rew_mean=0.0, ep_len_mean=0.0):
-        self.num_timesteps += obs.shape[0]
         advs, returns = self.compute_gae(rewards, values, dones, next_val)
-        advs = (advs - mx.mean(advs)) / (mx.std(advs) + 1e-8)
+        flat_obs = obs.reshape(-1, self.obs_dim)
+        flat_act = actions.reshape(-1, self.act_dim)
+        flat_advs = advs.reshape(-1)
+        flat_returns = returns.reshape(-1)
+        flat_vals = values.reshape(-1)
+        flat_lps = log_probs.reshape(-1)
 
-        N = obs.shape[0]
+        self.num_timesteps += flat_obs.shape[0]
+        advs_norm = (flat_advs - mx.mean(flat_advs)) / (mx.std(flat_advs) + 1e-8)
+
+        N = flat_obs.shape[0]
         p_losses, v_losses, e_losses, kls, clip_fracs = [], [], [], [], []
 
         def ppo_loss(model, b_obs, b_act, b_old_lp, b_adv, b_ret):
@@ -161,13 +179,14 @@ class PPO:
             return tot_loss, (p_loss, v_loss, entropy, approx_kl, clip_frac)
 
         loss_and_grad_fn = nn.value_and_grad(self.policy, ppo_loss)
+        bs = min(self.batch_size, N)
 
         for _ in range(self.n_epochs):
             indices = mx.random.permutation(N)
-            for start in range(0, N, self.batch_size):
-                idx = indices[start:start + self.batch_size]
+            for start in range(0, N, bs):
+                idx = indices[start:start + bs]
                 (_, (p_loss, v_loss, ent, kl, clip_frac)), grads = loss_and_grad_fn(
-                    self.policy, obs[idx], actions[idx], log_probs[idx], advs[idx], returns[idx]
+                    self.policy, flat_obs[idx], flat_act[idx], flat_lps[idx], advs_norm[idx], flat_returns[idx]
                 )
                 if self.max_grad_norm > 0:
                     grads, _ = opt.clip_grad_norm(grads, self.max_grad_norm)
@@ -182,6 +201,7 @@ class PPO:
 
         elapsed = time.time() - self.start_time
         fps = int(self.num_timesteps / max(elapsed, 1e-6))
+        exp_var = float((1.0 - mx.var(flat_returns - flat_vals) / (mx.var(flat_returns) + 1e-8)).item())
         metrics = {
             "time/total_timesteps": self.num_timesteps,
             "time/fps": fps,
@@ -192,10 +212,12 @@ class PPO:
             "train/entropy_loss": float(sum(e_losses) / len(e_losses)),
             "train/approx_kl": float(sum(kls) / len(kls)),
             "train/clip_fraction": float(sum(clip_fracs) / len(clip_fracs)),
-            "train/explained_variance": float((1.0 - mx.var(returns - values) / (mx.var(returns) + 1e-8)).item()),
+            "train/explained_variance": exp_var,
             "rollout/ep_rew_mean": float(ep_rew_mean),
             "rollout/ep_len_mean": float(ep_len_mean),
         }
+        self.logger.log(metrics)
+        return metrics
         self.logger.log(metrics)
         return metrics
 

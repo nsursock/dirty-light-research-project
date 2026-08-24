@@ -14,6 +14,7 @@ try:
     from scripts.env import MultiCryptoDexPerpEnv
     from scripts.ppo import PPO
     from scripts.sac import SAC
+    from scripts.agents import compute_goal_alignment
     from scripts.data import get_timeframe_ratio, generate_multi_tf_data
     from scripts.report import create_run_dir, TradeHistoryLogger, generate_breakdown_report, get_symbol_name, compute_financial_metrics
     from scripts.visualize import generate_trade_figures
@@ -22,6 +23,7 @@ except ModuleNotFoundError:
     from env import MultiCryptoDexPerpEnv
     from ppo import PPO
     from sac import SAC
+    from agents import compute_goal_alignment
     from data import get_timeframe_ratio, generate_multi_tf_data
     from report import create_run_dir, TradeHistoryLogger, generate_breakdown_report, get_symbol_name, compute_financial_metrics
     from visualize import generate_trade_figures
@@ -39,10 +41,10 @@ def resolve_theme(theme: str | None = None) -> str:
 
 def create_agents(obs_dim: int, num_symbols: int, ppo_csv: str | None = None, sac_csv: str | None = None, sac_train_freq: int | None = None):
     """Initializes PPO Manager and SAC Worker."""
-    goal_dim = num_symbols
+    goal_dim = num_symbols * 5  # side, leverage, collateral, tp, sl
     worker_obs_dim = obs_dim + goal_dim
-    worker_act_dim = num_symbols
-    ppo_manager = PPO(obs_dim=obs_dim, act_dim=goal_dim, n_steps=32, batch_size=16, n_epochs=4, csv_path=ppo_csv)
+    worker_act_dim = num_symbols * 5
+    ppo_manager = PPO(obs_dim=obs_dim, act_dim=goal_dim, n_steps=8, batch_size=4, n_epochs=4, csv_path=ppo_csv)
     sac_worker = SAC(obs_dim=worker_obs_dim, act_dim=worker_act_dim, learning_starts=32, batch_size=32, train_freq=sac_train_freq, csv_path=sac_csv)
     return ppo_manager, sac_worker
 
@@ -72,10 +74,11 @@ def train_hrl(
     ppo_manager, sac_worker = create_agents(obs_dim, num_symbols, ppo_csv=ppo_csv, sac_csv=sac_csv, sac_train_freq=sac_tf)
 
     obs, _ = env.reset(seed=100)
-    goals = mx.zeros((num_envs, num_symbols)) if num_envs > 1 else mx.zeros((num_symbols,))
+    goals = mx.zeros((num_envs, num_symbols * 5)) if num_envs > 1 else mx.zeros((num_symbols * 5,))
     macro_rews = mx.zeros((num_envs,)) if num_envs > 1 else mx.zeros((1,))
     m_buf = {"obs": [], "act": [], "rew": [], "done": [], "val": [], "lp": []}
     ep_rews, cur_ep_rew = [], 0.0
+    macro_rollout_steps = max(1, ppo_manager.n_steps // max(num_envs, 1))
 
     timesteps = 0
     t_start = time.time()
@@ -93,14 +96,14 @@ def train_hrl(
                 macro_obs = env.get_macro_obs()
                 macro_obs = macro_obs[None, :] if num_envs == 1 else macro_obs
                 macro_obs_norm = (macro_obs - mx.mean(macro_obs, axis=-1, keepdims=True)) / (mx.std(macro_obs, axis=-1, keepdims=True) + 1e-6)
-                if len(m_buf["obs"]) >= ppo_manager.n_steps:
+                if len(m_buf["obs"]) >= macro_rollout_steps and len(m_buf["rew"]) == len(m_buf["obs"]):
                     if manager_train:
                         _, _, _, next_v = ppo_manager.policy(macro_obs_norm)
                         ppo_manager.train_on_rollout(
-                            mx.concatenate(m_buf["obs"], axis=0), mx.concatenate(m_buf["act"], axis=0),
-                            mx.concatenate(m_buf["rew"], axis=0), mx.concatenate(m_buf["done"], axis=0),
-                            mx.concatenate(m_buf["val"], axis=0), mx.concatenate(m_buf["lp"], axis=0),
-                            next_v[0] if num_envs == 1 else next_v.mean(),
+                            mx.stack(m_buf["obs"], axis=0), mx.stack(m_buf["act"], axis=0),
+                            mx.stack(m_buf["rew"], axis=0), mx.stack(m_buf["done"], axis=0),
+                            mx.stack(m_buf["val"], axis=0), mx.stack(m_buf["lp"], axis=0),
+                            next_v[0] if num_envs == 1 else next_v,
                             ep_rew_mean=sum(ep_rews[-10:]) / max(len(ep_rews[-10:]), 1)
                         )
                     for k in m_buf:
@@ -108,10 +111,10 @@ def train_hrl(
 
                 goal, lp, _, val = ppo_manager.policy(macro_obs_norm)
                 goals = goal[0] if num_envs == 1 else goal
-                m_buf["obs"].append(macro_obs_norm)
-                m_buf["act"].append(goal)
-                m_buf["val"].append(val)
-                m_buf["lp"].append(lp)
+                m_buf["obs"].append(macro_obs_norm[0] if num_envs == 1 else macro_obs_norm)
+                m_buf["act"].append(goal[0] if num_envs == 1 else goal)
+                m_buf["val"].append(val[0] if num_envs == 1 else val)
+                m_buf["lp"].append(lp[0] if num_envs == 1 else lp)
                 macro_rews = mx.zeros_like(macro_rews)
 
             # Micro Step (SAC Worker at Low TF)
@@ -129,13 +132,17 @@ def train_hrl(
             next_obs_norm = (next_o - mx.mean(next_o, axis=-1, keepdims=True)) / (mx.std(next_o, axis=-1, keepdims=True) + 1e-6)
             next_worker_obs = mx.concatenate([next_obs_norm, g_in], axis=-1)
 
-            sac_worker.store(worker_obs, worker_act, rew, next_worker_obs, float(done) if num_envs == 1 else mx.full((num_envs,), float(done)))
+            align_rew = compute_goal_alignment(worker_act, g_in, num_symbols)
+            worker_rew = rew + (0.1 * align_rew if num_envs > 1 else float(0.1 * align_rew.item()))
+            sac_worker.store(worker_obs, worker_act, worker_rew, next_worker_obs, float(done) if num_envs == 1 else mx.full((num_envs,), float(done)))
             if worker_train and (timesteps % sac_worker.train_freq == 0):
                 sac_worker.train(gradient_steps=sac_worker.gradient_steps, ep_rew_mean=sum(ep_rews[-10:]) / max(len(ep_rews[-10:]), 1))
 
             if (env.t % period == 0) or done:
-                m_buf["rew"].append(macro_rews[None, :] if num_envs == 1 else macro_rews)
-                m_buf["done"].append(mx.full((1,) if num_envs == 1 else (num_envs,), float(done)))
+                if len(m_buf["rew"]) < len(m_buf["obs"]):
+                    m_buf["rew"].append(macro_rews[0] if num_envs == 1 else macro_rews)
+                    m_buf["done"].append(mx.array(float(done)) if num_envs == 1 else mx.full((num_envs,), float(done)))
+                    macro_rews = mx.zeros_like(macro_rews)
 
             inc = num_envs
             timesteps += inc
@@ -150,9 +157,24 @@ def train_hrl(
                 ep_rews.append(cur_ep_rew)
                 cur_ep_rew = 0.0
                 obs, _ = env.reset(seed=timesteps + 17)
-                goals = mx.zeros((num_envs, num_symbols)) if num_envs > 1 else mx.zeros((num_symbols,))
+                goals = mx.zeros((num_envs, num_symbols * 5)) if num_envs > 1 else mx.zeros((num_symbols * 5,))
             else:
                 obs = next_obs
+
+    if len(m_buf["obs"]) > 0 and len(m_buf["rew"]) == len(m_buf["obs"]) and manager_train:
+        macro_obs = env.get_macro_obs()
+        macro_obs = macro_obs[None, :] if num_envs == 1 else macro_obs
+        macro_obs_norm = (macro_obs - mx.mean(macro_obs, axis=-1, keepdims=True)) / (mx.std(macro_obs, axis=-1, keepdims=True) + 1e-6)
+        _, _, _, next_v = ppo_manager.policy(macro_obs_norm)
+        ppo_manager.train_on_rollout(
+            mx.stack(m_buf["obs"], axis=0), mx.stack(m_buf["act"], axis=0),
+            mx.stack(m_buf["rew"], axis=0), mx.stack(m_buf["done"], axis=0),
+            mx.stack(m_buf["val"], axis=0), mx.stack(m_buf["lp"], axis=0),
+            next_v[0] if num_envs == 1 else next_v,
+            ep_rew_mean=sum(ep_rews[-10:]) / max(len(ep_rews[-10:]), 1)
+        )
+        for k in m_buf:
+            m_buf[k].clear()
 
     total_time = time.time() - t_start
     print(f"Training finished: {timesteps} steps in {total_time:.2f}s ({timesteps / total_time:.1f} FPS)")
@@ -192,7 +214,7 @@ def evaluate_hrl(
                 num_candles=num_candles, margin_mode=margin_mode, high_tf=high_tf, low_tf=low_tf, record_trades=rec
             )
             obs, info = env.reset()
-            goals = mx.zeros((b_size, num_symbols)) if b_size > 1 else mx.zeros((num_symbols,))
+            goals = mx.zeros((b_size, num_symbols * 5)) if b_size > 1 else mx.zeros((num_symbols * 5,))
 
             batch_trades = []
             for t in range(num_candles - 1):

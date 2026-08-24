@@ -21,7 +21,45 @@ except ModuleNotFoundError:
     from data import generate_multi_tf_data, get_timeframe_ratio, FEATURE_NAMES, BINANCE_TIMEFRAMES
     from report import create_run_dir, TradeHistoryLogger
 
-__all__ = ["PPO", "SAC", "PPOActorCritic", "SACActor", "SACCritic", "ReplayBuffer", "CSVLogger", "run_hrl_simulation"]
+__all__ = ["PPO", "SAC", "PPOActorCritic", "SACActor", "SACCritic", "ReplayBuffer", "CSVLogger", "run_hrl_simulation", "decode_macro_goals", "compute_goal_alignment"]
+
+
+def decode_macro_goals(raw_goals: mx.array, num_symbols: int):
+    """
+    Decodes continuous PPO macro policy outputs into discrete/structured goals for the low-TF SAC worker.
+    raw_goals: (..., num_symbols * 5)
+    Returns:
+        discrete_side: (..., num_symbols) -> -1.0 (Short), 0.0 (Hold/Flat), 1.0 (Long)
+        target_risk_tier: (..., num_symbols) -> 0.0 (Conservative), 1.0 (Moderate), 2.0 (Aggressive)
+        target_regime: (..., num_symbols) -> -1.0 (Scalp/Tight), 1.0 (Swing/Wide)
+    """
+    g = raw_goals.reshape(*raw_goals.shape[:-1], num_symbols, 5)
+    raw_side, raw_risk, raw_tp = g[..., 0], g[..., 2], g[..., 3]
+    side = mx.where(raw_side > 0.25, 1.0, mx.where(raw_side < -0.25, -1.0, 0.0))
+    exposure_tier = mx.where(raw_risk < -0.2, 0.0, mx.where(raw_risk > 0.4, 2.0, 1.0))
+    regime = mx.where(raw_tp > 0.0, 1.0, -1.0)
+    return side, exposure_tier, regime
+
+
+def compute_goal_alignment(worker_act: mx.array, raw_goals: mx.array, num_symbols: int):
+    """
+    Computes semantic goal alignment reward for the worker:
+    - Directional alignment: worker direction matches manager target side
+    - Exposure alignment: worker risk selection matches manager target risk tier
+    - TP/SL regime alignment: worker TP/SL width matches manager target regime
+    """
+    w_acts = worker_act.reshape(*worker_act.shape[:-1], num_symbols, 5)
+    target_side, target_exposure, target_regime = decode_macro_goals(raw_goals, num_symbols)
+    w_raw_side = w_acts[..., 0]
+    w_direction = mx.where(w_raw_side > 0.2, 1.0, mx.where(w_raw_side < -0.2, -1.0, 0.0))
+    side_align = w_direction * target_side
+    target_norm_risk = (target_exposure - 1.0) * 0.6
+    w_risk = w_acts[..., 2]
+    exposure_align = -mx.abs(w_risk - target_norm_risk)
+    w_tp = w_acts[..., 3]
+    regime_align = mx.where(target_regime > 0, w_tp, -w_tp)
+    alignment = mx.mean(0.5 * side_align + 0.3 * exposure_align + 0.2 * regime_align, axis=-1)
+    return alignment
 
 
 def run_hrl_simulation(config=None, log_dir=None, high_tf: str = "1h", low_tf: str = "5m"):
@@ -47,11 +85,11 @@ def run_hrl_simulation(config=None, log_dir=None, high_tf: str = "1h", low_tf: s
     mx.eval(low_data, high_data)
 
     obs_dim = num_symbols * len(FEATURE_NAMES)
-    goal_dim = num_symbols
+    goal_dim = num_symbols * 5  # side, leverage, collateral, tp, sl
     worker_obs_dim = obs_dim + goal_dim
-    worker_act_dim = num_symbols
+    worker_act_dim = num_symbols * 5
 
-    ppo_manager = PPO(obs_dim=obs_dim, act_dim=goal_dim, n_steps=20, batch_size=10, n_epochs=4, csv_path=ppo_csv)
+    ppo_manager = PPO(obs_dim=obs_dim, act_dim=goal_dim, n_steps=8, batch_size=4, n_epochs=4, csv_path=ppo_csv)
     sac_worker = SAC(obs_dim=worker_obs_dim, act_dim=worker_act_dim, learning_starts=32, batch_size=32, csv_path=sac_csv)
 
     t_start = time.time()
@@ -96,9 +134,12 @@ def run_hrl_simulation(config=None, log_dir=None, high_tf: str = "1h", low_tf: s
             next_low_obs = low_data[t + 1].reshape(-1)
             next_low_norm = (next_low_obs - mx.mean(next_low_obs)) / (mx.std(next_low_obs) + 1e-6)
             price_ret = low_data[t + 1, :, 7]  # log_ret
-            # Worker reward: profit + goal alignment incentive
-            goal_alignment = -float(mx.mean((worker_act - goal[0]) ** 2).item())
-            worker_rew = float(mx.sum(worker_act * price_ret).item()) + 0.1 * goal_alignment
+            
+            # Worker reward: profit from trade side + structured goal alignment incentive
+            act_reshaped = worker_act.reshape(num_symbols, 5)
+            direction = mx.where(act_reshaped[:, 0] > 0.2, 1.0, mx.where(act_reshaped[:, 0] < -0.2, -1.0, 0.0))
+            goal_alignment = float(compute_goal_alignment(worker_act, goal[0], num_symbols).item())
+            worker_rew = float(mx.sum(direction * price_ret).item()) + 0.1 * goal_alignment
             macro_reward += worker_rew
             cur_ep_rew += worker_rew
 

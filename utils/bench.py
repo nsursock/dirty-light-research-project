@@ -71,7 +71,7 @@ def bench_train_fps(num_envs: int, steps: int = 100, steps_per_env: int | None =
     obs_dim, period, sac_tf = env.obs_dim, get_timeframe_ratio("1h", "5m"), max(1, num_envs // 2)
     ppo_manager, sac_worker = create_agents(obs_dim, num_symbols, sac_train_freq=sac_tf)
     obs, _ = env.reset(seed=100)
-    goals = mx.zeros((num_envs, num_symbols)) if num_envs > 1 else mx.zeros((num_symbols,))
+    goals = mx.zeros((num_envs, num_symbols * 5)) if num_envs > 1 else mx.zeros((num_symbols * 5,))
     macro_rews, m_buf = (mx.zeros((num_envs,)) if num_envs > 1 else mx.zeros((1,))), {"obs": [], "act": [], "rew": [], "done": [], "val": [], "lp": []}
     w_obs = mx.concatenate([obs[None, :] if num_envs == 1 else obs, goals[None, :] if num_envs == 1 else goals], axis=-1)
     mx.eval(sac_worker.predict(w_obs))
@@ -115,7 +115,7 @@ def bench_train_fps(num_envs: int, steps: int = 100, steps_per_env: int | None =
         timesteps += num_envs
         if done:
             obs, _ = env.reset(seed=timesteps + 17)
-            goals = mx.zeros((num_envs, num_symbols)) if num_envs > 1 else mx.zeros((num_symbols,))
+            goals = mx.zeros((num_envs, num_symbols * 5)) if num_envs > 1 else mx.zeros((num_symbols * 5,))
         else:
             obs = next_obs
         mx.eval(obs, rew)
@@ -129,7 +129,7 @@ def profile_breakdown(num_envs: int = 256, steps: int = 100, num_symbols: int = 
     obs_dim, period = env.obs_dim, get_timeframe_ratio("1h", "5m")
     ppo_manager, sac_worker = create_agents(obs_dim, num_symbols, sac_train_freq=max(1, num_envs // 2))
     obs, _ = env.reset(seed=100)
-    goals = mx.zeros((num_envs, num_symbols)) if num_envs > 1 else mx.zeros((num_symbols,))
+    goals = mx.zeros((num_envs, num_symbols * 5)) if num_envs > 1 else mx.zeros((num_symbols * 5,))
     macro_rews = mx.zeros((num_envs,)) if num_envs > 1 else mx.zeros((1,))
     m_buf = {"obs": [], "act": [], "rew": [], "done": [], "val": [], "lp": []}
     times = {k: 0.0 for k in ["env_step", "manager_forward", "worker_forward", "sac_critic", "sac_actor", "ppo_update", "buffer_ops", "obs_construction", "reward_computation", "mlx_sync"]}
@@ -208,7 +208,7 @@ def profile_breakdown(num_envs: int = 256, steps: int = 100, num_symbols: int = 
         timesteps += num_envs
         if done:
             obs, _ = env.reset(seed=timesteps + 17)
-            goals = mx.zeros((num_envs, num_symbols)) if num_envs > 1 else mx.zeros((num_symbols,))
+            goals = mx.zeros((num_envs, num_symbols * 5)) if num_envs > 1 else mx.zeros((num_symbols * 5,))
         else:
             obs = next_obs
         t0 = time.perf_counter()

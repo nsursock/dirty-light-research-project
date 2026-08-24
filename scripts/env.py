@@ -21,29 +21,64 @@ class MultiCryptoDexPerpEnv:
         num_candles: int | None = None, margin_mode: str | None = None, max_open_pos_per_symbol: int = 1,
         initial_capital: float | None = None, min_leverage: float | None = None, max_leverage: float | None = None,
         min_risk_per_trade: float | None = None, max_risk_per_trade: float | None = None,
-        min_collateral: float | None = None, max_collateral: float | None = None, fee_rate: float | None = None,
-        slippage_coef: float | None = None, maintenance_margin_rate: float | None = None,
+        min_collateral: float | None = None, max_collateral: float | None = None,
+        fee_rate: float | None = None, slippage_coef: float | None = None, maintenance_margin_rate: float | None = None,
+        liq_threshold_low_lev: float | None = None, liq_threshold_low_pct: float | None = None,
+        liq_threshold_high_lev: float | None = None, liq_threshold_high_pct: float | None = None,
         liquidation_penalty: float | None = None, martin_penalty_weight: float | None = None,
+        min_tp_pct: float | None = None, max_tp_pct: float | None = None,
+        min_sl_pct: float | None = None, max_sl_pct: float | None = None,
+        min_take_profit_pct: float | None = None, max_take_profit_pct: float | None = None,
+        min_stop_loss_pct: float | None = None, max_stop_loss_pct: float | None = None,
         take_profit_pct: float | None = None, stop_loss_pct: float | None = None,
         record_trades: bool = False, config=None,
     ):
         c = config or cfg
         env_cfg, sim_cfg = getattr(c, "env", {}), getattr(c, "simulation", {})
-        self.num_envs, self.num_symbols, self.num_candles = max(1, int(num_envs)), num_symbols or getattr(c.data, "num_symbols", 4), num_candles or getattr(c.data, "num_candles", 600)
-        self.high_tf, self.low_tf = high_tf or getattr(sim_cfg, "high_tf", "1h"), low_tf or getattr(sim_cfg, "low_tf", "5m")
+        self.num_envs = max(1, int(num_envs))
+        self.num_symbols = num_symbols if num_symbols is not None else getattr(c.data, "num_symbols", 4)
+        self.num_candles = num_candles if num_candles is not None else getattr(c.data, "num_candles", 600)
+        self.high_tf = high_tf if high_tf is not None else getattr(sim_cfg, "high_tf", "1h")
+        self.low_tf = low_tf if low_tf is not None else getattr(sim_cfg, "low_tf", "5m")
         self.macro_period = get_timeframe_ratio(self.high_tf, self.low_tf)
-        self.margin_mode = (margin_mode or getattr(env_cfg, "margin_mode", "isolated")).lower()
+        self.margin_mode = (margin_mode if margin_mode is not None else getattr(env_cfg, "margin_mode", "isolated")).lower()
         assert self.margin_mode in ("isolated", "cross"), f"Invalid margin_mode: {self.margin_mode}"
-        self.max_open_pos, self.initial_capital = max_open_pos_per_symbol or getattr(env_cfg, "max_open_pos_per_symbol", 1), float(initial_capital or getattr(env_cfg, "initial_capital", 10000.0))
-        self.min_leverage, self.max_leverage = float(min_leverage or getattr(env_cfg, "min_leverage", 2.0)), float(max_leverage or getattr(env_cfg, "max_leverage", 150.0))
-        self.min_risk, self.max_risk = float(min_risk_per_trade or getattr(env_cfg, "min_risk_per_trade", 0.01)), float(max_risk_per_trade or getattr(env_cfg, "max_risk_per_trade", 0.05))
-        self.min_collateral, self.max_collateral = float(min_collateral or getattr(env_cfg, "min_collateral", 10.0)), float(max_collateral or getattr(env_cfg, "max_collateral", 1000.0))
-        self.fee_rate, self.slippage_coef = float(fee_rate or getattr(env_cfg, "fee_rate", 0.0006)), float(slippage_coef or getattr(env_cfg, "slippage_coef", 0.0001))
+        self.max_open_pos = max_open_pos_per_symbol if max_open_pos_per_symbol is not None else getattr(env_cfg, "max_open_pos_per_symbol", 1)
+        self.initial_capital = float(initial_capital if initial_capital is not None else getattr(env_cfg, "initial_capital", 10000.0))
+        self.min_leverage = float(min_leverage if min_leverage is not None else getattr(env_cfg, "min_leverage", 2.0))
+        self.max_leverage = float(max_leverage if max_leverage is not None else getattr(env_cfg, "max_leverage", 150.0))
+        self.min_risk = float(min_risk_per_trade if min_risk_per_trade is not None else getattr(env_cfg, "min_risk_per_trade", 0.01))
+        self.max_risk = float(max_risk_per_trade if max_risk_per_trade is not None else getattr(env_cfg, "max_risk_per_trade", 0.05))
+        self.min_collateral = float(min_collateral if min_collateral is not None else getattr(env_cfg, "min_collateral", 10.0))
+        self.max_collateral = float(max_collateral if max_collateral is not None else getattr(env_cfg, "max_collateral", 1000.0))
+        self.fee_rate = float(fee_rate if fee_rate is not None else getattr(env_cfg, "fee_rate", 0.0006))
+        self.slippage_coef = float(slippage_coef if slippage_coef is not None else getattr(env_cfg, "slippage_coef", 0.0001))
         self.fixed_mmr = float(maintenance_margin_rate) if maintenance_margin_rate is not None else getattr(env_cfg, "maintenance_margin_rate", None)
-        self.liq_penalty, self.martin_weight = float(liquidation_penalty or getattr(env_cfg, "liquidation_penalty", 0.01)), float(martin_penalty_weight or getattr(env_cfg, "martin_penalty_weight", 5.0))
+        self.liq_low_lev = float(liq_threshold_low_lev if liq_threshold_low_lev is not None else getattr(env_cfg, "liq_threshold_low_lev", 2.0))
+        self.liq_low_pct = float(liq_threshold_low_pct if liq_threshold_low_pct is not None else getattr(env_cfg, "liq_threshold_low_pct", 0.90))
+        self.liq_high_lev = float(liq_threshold_high_lev if liq_threshold_high_lev is not None else getattr(env_cfg, "liq_threshold_high_lev", 150.0))
+        self.liq_high_pct = float(liq_threshold_high_pct if liq_threshold_high_pct is not None else getattr(env_cfg, "liq_threshold_high_pct", 0.67))
+        self.liq_penalty = float(liquidation_penalty if liquidation_penalty is not None else getattr(env_cfg, "liquidation_penalty", 0.01))
+        self.martin_weight = float(martin_penalty_weight if martin_penalty_weight is not None else getattr(env_cfg, "martin_penalty_weight", 5.0))
         self.bankrupt_thresh = float(getattr(env_cfg, "bankruptcy_threshold", 1e-4)) * self.initial_capital
-        self.tp_pct = (None if (take_profit_pct is False or take_profit_pct == 0.0) else (float(take_profit_pct) if take_profit_pct is not None else getattr(env_cfg, "take_profit_pct", 0.04)))
-        self.sl_pct = (None if (stop_loss_pct is False or stop_loss_pct == 0.0) else (float(stop_loss_pct) if stop_loss_pct is not None else getattr(env_cfg, "stop_loss_pct", 0.02)))
+        
+        tp_min = min_tp_pct if min_tp_pct is not None else (min_take_profit_pct if min_take_profit_pct is not None else getattr(env_cfg, "min_tp_pct", getattr(env_cfg, "min_take_profit_pct", 0.01)))
+        tp_max = max_tp_pct if max_tp_pct is not None else (max_take_profit_pct if max_take_profit_pct is not None else getattr(env_cfg, "max_tp_pct", getattr(env_cfg, "max_take_profit_pct", 0.15)))
+        sl_min = min_sl_pct if min_sl_pct is not None else (min_stop_loss_pct if min_stop_loss_pct is not None else getattr(env_cfg, "min_sl_pct", getattr(env_cfg, "min_stop_loss_pct", 0.005)))
+        sl_max = max_sl_pct if max_sl_pct is not None else (max_stop_loss_pct if max_stop_loss_pct is not None else getattr(env_cfg, "max_sl_pct", getattr(env_cfg, "max_stop_loss_pct", 0.05)))
+
+        if take_profit_pct is not None:
+            val = float(take_profit_pct)
+            self.min_tp_pct, self.max_tp_pct = (0.0, 0.0) if val <= 0.0 else (val, val)
+        else:
+            self.min_tp_pct, self.max_tp_pct = float(tp_min), float(tp_max)
+
+        if stop_loss_pct is not None:
+            val = float(stop_loss_pct)
+            self.min_sl_pct, self.max_sl_pct = (0.0, 0.0) if val <= 0.0 else (val, val)
+        else:
+            self.min_sl_pct, self.max_sl_pct = float(sl_min), float(sl_max)
+
         self.record_trades = record_trades
         self.data, self.high_tf_data = data, high_tf_data
         self.num_features = len(FEATURE_NAMES)
@@ -174,27 +209,69 @@ class MultiCryptoDexPerpEnv:
     def step(self, action: mx.array | list):
         if not isinstance(action, mx.array):
             action = mx.array(action, dtype=mx.float32)
-        if action.ndim == 1 and self.num_envs > 1:
-            action = mx.tile(action[None, :], (self.num_envs, 1))
-        elif action.ndim == 1 and self.num_envs == 1:
-            action = action[None, :]
 
-        action = mx.clip(action, -1.0, 1.0)
-        abs_act, direction = mx.abs(action), mx.sign(action)
-        is_active = abs_act > 1e-4
+        if action.ndim == 2 and action.shape == (self.num_symbols, 5):
+            action = mx.tile(action[None, :], (self.num_envs, 1, 1)) if self.num_envs > 1 else action[None, :]
+        elif action.ndim == 1 and action.shape[0] == self.num_symbols * 5:
+            reshaped = action.reshape(1, self.num_symbols, 5)
+            action = mx.tile(reshaped, (self.num_envs, 1, 1)) if self.num_envs > 1 else reshaped
+        elif action.ndim == 2 and action.shape[-1] == self.num_symbols * 5:
+            if action.shape[0] == 1 and self.num_envs > 1:
+                action = mx.tile(action, (self.num_envs, 1))
+            action = action.reshape(self.num_envs, self.num_symbols, 5)
+        elif action.ndim == 1 and action.shape[0] == self.num_symbols:
+            action = mx.tile(action[None, :], (self.num_envs, 1)) if self.num_envs > 1 else action[None, :]
+        elif action.ndim == 2 and action.shape == (1, self.num_symbols) and self.num_envs > 1:
+            action = mx.tile(action, (self.num_envs, 1))
+        elif action.ndim == 3 and action.shape[0] == 1 and self.num_envs > 1:
+            action = mx.tile(action, (self.num_envs, 1, 1))
 
-        # 1. Dynamic Collateral & Target Sizing
-        risk = self.min_risk + abs_act * (self.max_risk - self.min_risk)
-        clamped_col = mx.clip(risk * self.equity, self.min_collateral, self.max_collateral)
-        tot_col = mx.sum(mx.where(is_active, clamped_col, 0.0), axis=-1, keepdims=True)
-        scale_c = mx.minimum(mx.ones_like(self.equity), self.equity / (tot_col + 1e-8))
-        collateral = mx.where(is_active, clamped_col * scale_c, 0.0)
+        if action.ndim == 3 and action.shape[1] == self.num_symbols and action.shape[2] == 5:
+            raw_side = mx.clip(action[..., 0], -1.0, 1.0)
+            raw_lev = mx.clip(action[..., 1], -1.0, 1.0)
+            raw_risk = mx.clip(action[..., 2], -1.0, 1.0)
+            raw_tp = mx.clip(action[..., 3], -1.0, 1.0)
+            raw_sl = mx.clip(action[..., 4], -1.0, 1.0)
 
-        if self.max_leverage > self.min_leverage > 0:
-            leverage = self.min_leverage * ((self.max_leverage / self.min_leverage) ** abs_act)
+            # Side: long (> 0.2), short (< -0.2), flat ([-0.2, 0.2])
+            direction = mx.where(raw_side > 0.2, 1.0, mx.where(raw_side < -0.2, -1.0, 0.0))
+            is_active = mx.abs(direction) > 0.5
+
+            norm_lev = (raw_lev + 1.0) / 2.0
+            leverage = self.min_leverage + norm_lev * (self.max_leverage - self.min_leverage)
+
+            norm_risk = (raw_risk + 1.0) / 2.0
+            risk_fraction = self.min_risk + norm_risk * (self.max_risk - self.min_risk)
+            req_col = risk_fraction * self.equity
+            clamped_col = mx.clip(req_col, self.min_collateral, self.max_collateral)
+            tot_col = mx.sum(mx.where(is_active, clamped_col, 0.0), axis=-1, keepdims=True)
+            scale_c = mx.minimum(mx.ones_like(self.equity), self.equity / (tot_col + 1e-8))
+            collateral = mx.where(is_active, clamped_col * scale_c, 0.0)
+            target_notional = mx.where(is_active, direction * collateral * leverage, 0.0)
+
+            norm_tp = (raw_tp + 1.0) / 2.0
+            tp_pct_sym = self.min_tp_pct + norm_tp * (self.max_tp_pct - self.min_tp_pct)
+            norm_sl = (raw_sl + 1.0) / 2.0
+            sl_pct_sym = self.min_sl_pct + norm_sl * (self.max_sl_pct - self.min_sl_pct)
         else:
-            leverage = mx.full(abs_act.shape, self.min_leverage)
-        target_notional = mx.where(is_active, direction * collateral * leverage, 0.0)
+            act = mx.clip(action.reshape(self.num_envs, self.num_symbols), -1.0, 1.0)
+            abs_act, direction = mx.abs(act), mx.sign(act)
+            is_active = abs_act > 1e-4
+
+            risk = self.min_risk + abs_act * (self.max_risk - self.min_risk)
+            req_col = risk * self.equity
+            clamped_col = mx.clip(req_col, self.min_collateral, self.max_collateral)
+            tot_col = mx.sum(mx.where(is_active, clamped_col, 0.0), axis=-1, keepdims=True)
+            scale_c = mx.minimum(mx.ones_like(self.equity), self.equity / (tot_col + 1e-8))
+            collateral = mx.where(is_active, clamped_col * scale_c, 0.0)
+
+            if self.max_leverage > self.min_leverage > 0:
+                leverage = self.min_leverage * ((self.max_leverage / self.min_leverage) ** abs_act)
+            else:
+                leverage = mx.full(abs_act.shape, self.min_leverage)
+            target_notional = mx.where(is_active, direction * collateral * leverage, 0.0)
+            tp_pct_sym = mx.full(leverage.shape, self.min_tp_pct)
+            sl_pct_sym = mx.full(leverage.shape, self.min_sl_pct)
 
         # 2. Pessimistic Low-TF Fills & Costs
         t_idx = min(self.t, self.num_candles - 1)
@@ -229,15 +306,23 @@ class MultiCryptoDexPerpEnv:
             n_open, n_high, n_low, n_close, n_funding = n_candle[..., 0], n_candle[..., 1], n_candle[..., 2], n_candle[..., 3], n_candle[..., 5]
 
         # 4. Pessimistic Low-TF Liq, SL, TP Evaluation (SL > Liq > TP > Hold)
-        mmr_sym = mx.full(leverage.shape, self.fixed_mmr) if self.fixed_mmr is not None else (1.0 / (2.0 * mx.maximum(leverage, 1.0)))
+        if self.fixed_mmr is not None:
+            mmr_sym = mx.full(leverage.shape, self.fixed_mmr)
+            liq_dist = mx.maximum(0.0, (1.0 / mx.maximum(leverage, 1.0)) - mmr_sym)
+        else:
+            lev_span = max(self.liq_high_lev - self.liq_low_lev, 1e-4)
+            alpha = mx.clip((leverage - self.liq_low_lev) / lev_span, 0.0, 1.0)
+            liq_thresh = self.liq_low_pct + alpha * (self.liq_high_pct - self.liq_low_pct)
+            liq_dist = liq_thresh / mx.maximum(leverage, 1.0)
+            mmr_sym = mx.maximum(0.0, (1.0 - liq_thresh) / mx.maximum(leverage, 1.0))
         is_long, is_short = target_notional > 1e-4, target_notional < -1e-4
-        liq_p_long = self.entry_prices * (1.0 - (1.0 / mx.maximum(leverage, 1.0)) + mmr_sym)
-        liq_p_short = self.entry_prices * (1.0 + (1.0 / mx.maximum(leverage, 1.0)) - mmr_sym)
+        liq_p_long = self.entry_prices * (1.0 - liq_dist)
+        liq_p_short = self.entry_prices * (1.0 + liq_dist)
         hit_liq = is_active & ((is_long & (n_low <= liq_p_long)) | (is_short & (n_high >= liq_p_short)))
-        sl_val, sl_enabled = (float(self.sl_pct) if self.sl_pct is not None else -1.0), (self.sl_pct is not None and self.sl_pct > 0)
-        tp_val, tp_enabled = (float(self.tp_pct) if self.tp_pct is not None else -1.0), (self.tp_pct is not None and self.tp_pct > 0)
-        sl_dist = mx.minimum(mx.full(leverage.shape, sl_val), 0.75 / mx.maximum(leverage, 1.0)) if sl_enabled else mx.zeros_like(leverage)
-        tp_dist = mx.minimum(mx.full(leverage.shape, tp_val), mx.maximum(1.5 * sl_dist, 1.5 / mx.maximum(leverage, 1.0))) if tp_enabled else mx.zeros_like(leverage)
+        sl_enabled = self.max_sl_pct > 0.0
+        tp_enabled = self.max_tp_pct > 0.0
+        sl_dist = mx.minimum(sl_pct_sym / mx.maximum(leverage, 1.0), liq_dist) if sl_enabled else mx.zeros_like(leverage)
+        tp_dist = (tp_pct_sym / mx.maximum(leverage, 1.0)) if tp_enabled else mx.zeros_like(leverage)
         sl_p_long = self.entry_prices * (1.0 - sl_dist) if sl_enabled else mx.zeros_like(self.entry_prices)
         sl_p_short = self.entry_prices * (1.0 + sl_dist) if sl_enabled else mx.full(self.entry_prices.shape, 1e9)
         hit_sl = is_active & ((is_long & (n_low <= sl_p_long)) | (is_short & (n_high >= sl_p_short))) if sl_enabled else mx.zeros_like(is_active)

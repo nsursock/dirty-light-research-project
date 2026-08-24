@@ -61,8 +61,8 @@ agents:
   ppo:
     hidden_dim: 64
     learning_rate: 0.0003
-    n_steps: 32
-    batch_size: 16
+    n_steps: 8
+    batch_size: 4
     n_epochs: 5
     gamma: 0.99
     gae_lambda: 0.95
@@ -75,8 +75,8 @@ agents:
     hidden_dim: 128
     learning_rate: 0.0003
     buffer_size: 100000
-    learning_starts: 64
-    batch_size: 64
+    learning_starts: 32
+    batch_size: 32
     tau: 0.005
     gamma: 0.99
     train_freq: 1
@@ -115,12 +115,18 @@ env:
   max_open_pos_per_symbol: 1
   fee_rate: 0.0006
   slippage_coef: 0.0001
-  maintenance_margin_rate: null # dynamic per leverage: 1 / (2 * leverage) if null
+  maintenance_margin_rate: null # dynamic interpolated threshold if null
+  liq_threshold_low_lev: 2.0
+  liq_threshold_low_pct: 0.90   # 2x liquidates at -90% perp PnL
+  liq_threshold_high_lev: 150.0
+  liq_threshold_high_pct: 0.67  # 150x liquidates at -67% perp PnL
   liquidation_penalty: 0.01
   martin_penalty_weight: 5.0
   bankruptcy_threshold: 1e-4
-  take_profit_pct: 0.04 # dynamic leverage-aware TP (e.g. 0.04 = 4%)
-  stop_loss_pct: 0.02   # dynamic leverage-aware SL (e.g. 0.02 = 2%)
+  min_tp_pct: 0.01          # 1% min TP
+  max_tp_pct: 0.15          # 15% max TP
+  min_sl_pct: 0.005         # 0.5% min SL
+  max_sl_pct: 0.05          # 5% max SL
 
 visualization:
   default_theme: "synthwave"

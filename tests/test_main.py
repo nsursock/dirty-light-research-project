@@ -15,9 +15,9 @@ from scripts.visualize import generate_trade_figures
 def test_create_agents():
     ppo_manager, sac_worker = create_agents(obs_dim=80, num_symbols=4)
     assert ppo_manager.obs_dim == 80
-    assert ppo_manager.act_dim == 4
-    assert sac_worker.obs_dim == 84
-    assert sac_worker.act_dim == 4
+    assert ppo_manager.act_dim == 20  # 4 symbols * 5 (side, leverage, collateral, tp, sl)
+    assert sac_worker.obs_dim == 100  # 80 + 20
+    assert sac_worker.act_dim == 20   # 4 symbols * 5
 
 
 def test_train_hrl_joint_and_alternating():
@@ -126,6 +126,14 @@ def test_simulation_run_dir_and_files(tmp_path, monkeypatch):
     assert perf_fig.exists() and perf_fig.stat().st_size > 0, "trade performance 2x2 figure required after breakdown"
     assert dist_fig.exists() and dist_fig.stat().st_size > 0, "trade distributions 2x2 figure required after breakdown"
 
+    with open(ppo_file, "r", encoding="utf-8") as f:
+        ppo_rows = list(csv.reader(f))
+        assert len(ppo_rows) > 1, "ppo_manager.csv should record training updates"
+
+    with open(sac_file, "r", encoding="utf-8") as f:
+        sac_rows = list(csv.reader(f))
+        assert len(sac_rows) > 1, "sac_worker.csv should record training steps"
+
     with open(trade_file, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         headers = next(reader)
@@ -212,4 +220,33 @@ def test_multi_timeframe_hrl_execution(high_tf, low_tf, tmp_path):
     assert len(results) == 1
     assert "martin_ratio" in results[0]
     assert "equity" in results[0]
+
+
+def test_statistically_significant_agent_csv_logging(tmp_path):
+    """Verifies that PPO and SAC training outputs statistically rich CSV logs."""
+    run_dir = tmp_path / "stat_run"
+    train_hrl(
+        total_timesteps=600,
+        num_envs=2,
+        train_scheme="joint",
+        num_symbols=2,
+        num_candles=60,
+        macro_period=4,
+        log_dir=run_dir,
+    )
+    ppo_file = run_dir / "ppo_manager.csv"
+    sac_file = run_dir / "sac_worker.csv"
+
+    assert ppo_file.exists()
+    assert sac_file.exists()
+
+    with open(ppo_file, "r", encoding="utf-8") as f:
+        ppo_rows = list(csv.DictReader(f))
+        assert len(ppo_rows) >= 5, f"PPO rows ({len(ppo_rows)}) should reflect frequent updates"
+        assert all("train/policy_loss" in r for r in ppo_rows)
+
+    with open(sac_file, "r", encoding="utf-8") as f:
+        sac_rows = list(csv.DictReader(f))
+        assert len(sac_rows) >= 50, f"SAC rows ({len(sac_rows)}) should reflect high frequency worker steps"
+        assert all("train/critic_loss" in r for r in sac_rows)
 
