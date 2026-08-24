@@ -73,6 +73,7 @@ def bench_train_fps(num_envs: int, steps: int = 100, steps_per_env: int | None =
     obs, _ = env.reset(seed=100)
     goals = mx.zeros((num_envs, num_symbols * 5)) if num_envs > 1 else mx.zeros((num_symbols * 5,))
     macro_rews, m_buf = (mx.zeros((num_envs,)) if num_envs > 1 else mx.zeros((1,))), {"obs": [], "act": [], "rew": [], "done": [], "val": [], "lp": []}
+    macro_rollout_steps = max(1, ppo_manager.n_steps // max(num_envs, 1))
     w_obs = mx.concatenate([obs[None, :] if num_envs == 1 else obs, goals[None, :] if num_envs == 1 else goals], axis=-1)
     mx.eval(sac_worker.predict(w_obs))
 
@@ -85,13 +86,21 @@ def bench_train_fps(num_envs: int, steps: int = 100, steps_per_env: int | None =
             macro_obs = env.get_macro_obs()
             macro_obs = macro_obs[None, :] if num_envs == 1 else macro_obs
             macro_obs_norm = (macro_obs - mx.mean(macro_obs, axis=-1, keepdims=True)) / (mx.std(macro_obs, axis=-1, keepdims=True) + 1e-6)
-            if len(m_buf["obs"]) >= ppo_manager.n_steps:
+            if len(m_buf["obs"]) >= macro_rollout_steps and len(m_buf["rew"]) == len(m_buf["obs"]):
                 _, _, _, next_v = ppo_manager.policy(macro_obs_norm)
-                ppo_manager.train_on_rollout(mx.concatenate(m_buf["obs"], axis=0), mx.concatenate(m_buf["act"], axis=0), mx.concatenate(m_buf["rew"], axis=0), mx.concatenate(m_buf["done"], axis=0), mx.concatenate(m_buf["val"], axis=0), mx.concatenate(m_buf["lp"], axis=0), next_v[0] if num_envs == 1 else next_v.mean())
+                ppo_manager.train_on_rollout(
+                    mx.stack(m_buf["obs"], axis=0), mx.stack(m_buf["act"], axis=0),
+                    mx.stack(m_buf["rew"], axis=0), mx.stack(m_buf["done"], axis=0),
+                    mx.stack(m_buf["val"], axis=0), mx.stack(m_buf["lp"], axis=0),
+                    next_v[0] if num_envs == 1 else next_v
+                )
                 for k in m_buf: m_buf[k].clear()
             goal, lp, _, val = ppo_manager.policy(macro_obs_norm)
             goals = goal[0] if num_envs == 1 else goal
-            m_buf["obs"].append(macro_obs_norm); m_buf["act"].append(goal); m_buf["val"].append(val); m_buf["lp"].append(lp)
+            m_buf["obs"].append(macro_obs_norm[0] if num_envs == 1 else macro_obs_norm)
+            m_buf["act"].append(goal[0] if num_envs == 1 else goal)
+            m_buf["val"].append(val[0] if num_envs == 1 else val)
+            m_buf["lp"].append(lp[0] if num_envs == 1 else lp)
             macro_rews = mx.zeros_like(macro_rews)
 
         g_in = goals[None, :] if num_envs == 1 else goals
@@ -109,8 +118,10 @@ def bench_train_fps(num_envs: int, steps: int = 100, steps_per_env: int | None =
             sac_worker.train(gradient_steps=sac_worker.gradient_steps)
 
         if (env.t % period == 0) or done:
-            m_buf["rew"].append(macro_rews[None, :] if num_envs == 1 else macro_rews)
-            m_buf["done"].append(mx.full((1,) if num_envs == 1 else (num_envs,), float(done)))
+            if len(m_buf["rew"]) < len(m_buf["obs"]):
+                m_buf["rew"].append(macro_rews[0] if num_envs == 1 else macro_rews)
+                m_buf["done"].append(mx.array(float(done)) if num_envs == 1 else mx.full((num_envs,), float(done)))
+                macro_rews = mx.zeros_like(macro_rews)
 
         timesteps += num_envs
         if done:
@@ -132,6 +143,7 @@ def profile_breakdown(num_envs: int = 256, steps: int = 100, num_symbols: int = 
     goals = mx.zeros((num_envs, num_symbols * 5)) if num_envs > 1 else mx.zeros((num_symbols * 5,))
     macro_rews = mx.zeros((num_envs,)) if num_envs > 1 else mx.zeros((1,))
     m_buf = {"obs": [], "act": [], "rew": [], "done": [], "val": [], "lp": []}
+    macro_rollout_steps = max(1, ppo_manager.n_steps // max(num_envs, 1))
     times = {k: 0.0 for k in ["env_step", "manager_forward", "worker_forward", "sac_critic", "sac_actor", "ppo_update", "buffer_ops", "obs_construction", "reward_computation", "mlx_sync"]}
 
     timesteps, t_start = 0, time.perf_counter()
@@ -145,10 +157,15 @@ def profile_breakdown(num_envs: int = 256, steps: int = 100, num_symbols: int = 
             macro_obs = env.get_macro_obs()
             macro_obs = macro_obs[None, :] if num_envs == 1 else macro_obs
             macro_obs_norm = (macro_obs - mx.mean(macro_obs, axis=-1, keepdims=True)) / (mx.std(macro_obs, axis=-1, keepdims=True) + 1e-6)
-            if len(m_buf["obs"]) >= ppo_manager.n_steps:
+            if len(m_buf["obs"]) >= macro_rollout_steps and len(m_buf["rew"]) == len(m_buf["obs"]):
                 t0 = time.perf_counter()
                 _, _, _, next_v = ppo_manager.policy(macro_obs_norm)
-                ppo_manager.train_on_rollout(mx.concatenate(m_buf["obs"], axis=0), mx.concatenate(m_buf["act"], axis=0), mx.concatenate(m_buf["rew"], axis=0), mx.concatenate(m_buf["done"], axis=0), mx.concatenate(m_buf["val"], axis=0), mx.concatenate(m_buf["lp"], axis=0), next_v[0] if num_envs == 1 else next_v.mean())
+                ppo_manager.train_on_rollout(
+                    mx.stack(m_buf["obs"], axis=0), mx.stack(m_buf["act"], axis=0),
+                    mx.stack(m_buf["rew"], axis=0), mx.stack(m_buf["done"], axis=0),
+                    mx.stack(m_buf["val"], axis=0), mx.stack(m_buf["lp"], axis=0),
+                    next_v[0] if num_envs == 1 else next_v
+                )
                 times["ppo_update"] += time.perf_counter() - t0
                 for k in m_buf: m_buf[k].clear()
 
@@ -157,7 +174,10 @@ def profile_breakdown(num_envs: int = 256, steps: int = 100, num_symbols: int = 
             times["manager_forward"] += time.perf_counter() - t0
             t0 = time.perf_counter()
             goals = goal[0] if num_envs == 1 else goal
-            m_buf["obs"].append(macro_obs_norm); m_buf["act"].append(goal); m_buf["val"].append(val); m_buf["lp"].append(lp)
+            m_buf["obs"].append(macro_obs_norm[0] if num_envs == 1 else macro_obs_norm)
+            m_buf["act"].append(goal[0] if num_envs == 1 else goal)
+            m_buf["val"].append(val[0] if num_envs == 1 else val)
+            m_buf["lp"].append(lp[0] if num_envs == 1 else lp)
             times["buffer_ops"] += time.perf_counter() - t0
             macro_rews = mx.zeros_like(macro_rews)
 
@@ -188,13 +208,11 @@ def profile_breakdown(num_envs: int = 256, steps: int = 100, num_symbols: int = 
             next_act, next_lp = sac_worker.actor.sample(b_next_obs)
             t_q1, t_q2 = sac_worker.target_critic(b_next_obs, next_act)
             target_q = b_rew + sac_worker.gamma * (1.0 - b_done) * (mx.minimum(t_q1, t_q2) - sac_worker.alpha * next_lp)
-            c_loss, c_grads = nn.value_and_grad(sac_worker.critic, lambda m, o, a, t: 0.5 * mx.mean((m(o, a)[0] - t) ** 2) + 0.5 * mx.mean((m(o, a)[1] - t) ** 2))(sac_worker.critic, b_obs, b_act, target_q)
-            sac_worker.critic_opt.update(sac_worker.critic, c_grads)
+            _ = sac_worker._compiled_critic(b_obs, b_act, target_q)
             times["sac_critic"] += time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            (a_loss, lp), a_grads = nn.value_and_grad(sac_worker.actor, lambda m, c, o, alpha: (mx.mean(alpha * m.sample(o)[1] - mx.minimum(*c(o, m.sample(o)[0]))), m.sample(o)[1]))(sac_worker.actor, sac_worker.critic, b_obs, sac_worker.alpha)
-            sac_worker.actor_opt.update(sac_worker.actor, a_grads)
+            _ = sac_worker._compiled_actor(b_obs, sac_worker.alpha)
             times["sac_actor"] += time.perf_counter() - t0
 
             t0 = time.perf_counter()
@@ -202,8 +220,10 @@ def profile_breakdown(num_envs: int = 256, steps: int = 100, num_symbols: int = 
             times["mlx_sync"] += time.perf_counter() - t0
 
         if (env.t % period == 0) or done:
-            m_buf["rew"].append(macro_rews[None, :] if num_envs == 1 else macro_rews)
-            m_buf["done"].append(mx.full((1,) if num_envs == 1 else (num_envs,), float(done)))
+            if len(m_buf["rew"]) < len(m_buf["obs"]):
+                m_buf["rew"].append(macro_rews[0] if num_envs == 1 else macro_rews)
+                m_buf["done"].append(mx.array(float(done)) if num_envs == 1 else mx.full((num_envs,), float(done)))
+                macro_rews = mx.zeros_like(macro_rews)
 
         timesteps += num_envs
         if done:
@@ -277,7 +297,7 @@ def run_benchmark(start_envs: int = 1, max_envs: int = 1024, steps: int = 100, s
 def main():
     p = argparse.ArgumentParser(description="Benchmark Pure MLX Env & Training FPS and Memory scaling.")
     p.add_argument("--start_envs", type=int, default=1)
-    p.add_argument("--max_envs", type=int, default=1024)
+    p.add_argument("--max_envs", type=int, default=100000)
     p.add_argument("--steps", type=int, default=100)
     p.add_argument("--plateau_tol", type=float, default=0.03)
     p.add_argument("--plateau_patience", type=int, default=2)

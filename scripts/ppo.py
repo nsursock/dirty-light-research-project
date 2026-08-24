@@ -113,6 +113,30 @@ class PPO:
         self.logger = CSVLogger(csv_p, fieldnames=PPO_METRICS_HEADER)
         self.num_timesteps = 0
         self.start_time = time.time()
+        self._init_compiled_step()
+
+    def _init_compiled_step(self):
+        def ppo_loss(model, b_obs, b_act, b_old_lp, b_adv, b_ret):
+            _, new_lp, entropy, vals = model(b_obs, b_act)
+            ratio = mx.exp(new_lp - b_old_lp)
+            p_loss = -mx.mean(mx.minimum(ratio * b_adv, mx.clip(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range) * b_adv))
+            v_loss = 0.5 * mx.mean((vals - b_ret) ** 2)
+            tot_loss = p_loss + self.vf_coef * v_loss - self.ent_coef * entropy
+            approx_kl = mx.mean(b_old_lp - new_lp)
+            clip_frac = mx.mean((mx.abs(ratio - 1.0) > self.clip_range).astype(mx.float32))
+            return tot_loss, (p_loss, v_loss, entropy, approx_kl, clip_frac)
+
+        loss_and_grad_fn = nn.value_and_grad(self.policy, ppo_loss)
+
+        def step(b_obs, b_act, b_old_lp, b_adv, b_ret):
+            (_, stats), grads = loss_and_grad_fn(self.policy, b_obs, b_act, b_old_lp, b_adv, b_ret)
+            if self.max_grad_norm > 0:
+                grads, _ = opt.clip_grad_norm(grads, self.max_grad_norm)
+            self.optimizer.update(self.policy, grads)
+            return stats
+
+        state = [self.policy.state, self.optimizer.state]
+        self._compiled_step = mx.compile(step, inputs=state, outputs=state)
 
     def predict(self, obs, deterministic=False):
         if not isinstance(obs, mx.array):
@@ -166,38 +190,23 @@ class PPO:
         advs_norm = (flat_advs - mx.mean(flat_advs)) / (mx.std(flat_advs) + 1e-8)
 
         N = flat_obs.shape[0]
-        p_losses, v_losses, e_losses, kls, clip_fracs = [], [], [], [], []
-
-        def ppo_loss(model, b_obs, b_act, b_old_lp, b_adv, b_ret):
-            _, new_lp, entropy, vals = model(b_obs, b_act)
-            ratio = mx.exp(new_lp - b_old_lp)
-            p_loss = -mx.mean(mx.minimum(ratio * b_adv, mx.clip(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range) * b_adv))
-            v_loss = 0.5 * mx.mean((vals - b_ret) ** 2)
-            tot_loss = p_loss + self.vf_coef * v_loss - self.ent_coef * entropy
-            approx_kl = mx.mean(b_old_lp - new_lp)
-            clip_frac = mx.mean((mx.abs(ratio - 1.0) > self.clip_range).astype(mx.float32))
-            return tot_loss, (p_loss, v_loss, entropy, approx_kl, clip_frac)
-
-        loss_and_grad_fn = nn.value_and_grad(self.policy, ppo_loss)
         bs = min(self.batch_size, N)
+        p_losses, v_losses, e_losses, kls, clip_fracs = [], [], [], [], []
 
         for _ in range(self.n_epochs):
             indices = mx.random.permutation(N)
             for start in range(0, N, bs):
                 idx = indices[start:start + bs]
-                (_, (p_loss, v_loss, ent, kl, clip_frac)), grads = loss_and_grad_fn(
-                    self.policy, flat_obs[idx], flat_act[idx], flat_lps[idx], advs_norm[idx], flat_returns[idx]
+                p_l, v_l, ent, kl, cf = self._compiled_step(
+                    flat_obs[idx], flat_act[idx], flat_lps[idx], advs_norm[idx], flat_returns[idx]
                 )
-                if self.max_grad_norm > 0:
-                    grads, _ = opt.clip_grad_norm(grads, self.max_grad_norm)
-                self.optimizer.update(self.policy, grads)
-                mx.eval(self.policy.state, self.optimizer.state)
+                p_losses.append(p_l)
+                v_losses.append(v_l)
+                e_losses.append(ent)
+                kls.append(kl)
+                clip_fracs.append(cf)
 
-                p_losses.append(p_loss.item())
-                v_losses.append(v_loss.item())
-                e_losses.append(ent.item())
-                kls.append(kl.item())
-                clip_fracs.append(clip_frac.item())
+        mx.eval(self.policy.state, self.optimizer.state, p_losses[-1], v_losses[-1], e_losses[-1], kls[-1], clip_fracs[-1])
 
         elapsed = time.time() - self.start_time
         fps = int(self.num_timesteps / max(elapsed, 1e-6))
@@ -207,17 +216,15 @@ class PPO:
             "time/fps": fps,
             "time/time_elapsed": elapsed,
             "train/learning_rate": self.learning_rate,
-            "train/policy_loss": float(sum(p_losses) / len(p_losses)),
-            "train/value_loss": float(sum(v_losses) / len(v_losses)),
-            "train/entropy_loss": float(sum(e_losses) / len(e_losses)),
-            "train/approx_kl": float(sum(kls) / len(kls)),
-            "train/clip_fraction": float(sum(clip_fracs) / len(clip_fracs)),
+            "train/policy_loss": float(mx.mean(mx.stack(p_losses)).item()),
+            "train/value_loss": float(mx.mean(mx.stack(v_losses)).item()),
+            "train/entropy_loss": float(mx.mean(mx.stack(e_losses)).item()),
+            "train/approx_kl": float(mx.mean(mx.stack(kls)).item()),
+            "train/clip_fraction": float(mx.mean(mx.stack(clip_fracs)).item()),
             "train/explained_variance": exp_var,
             "rollout/ep_rew_mean": float(ep_rew_mean),
             "rollout/ep_len_mean": float(ep_len_mean),
         }
-        self.logger.log(metrics)
-        return metrics
         self.logger.log(metrics)
         return metrics
 

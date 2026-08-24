@@ -75,6 +75,34 @@ python scripts/main.py --stage S1 --mode train
 python scripts/main.py --stage configs/stages/S2_research.yaml -t 100000  # CLI still overrides
 ```
 
+## Benchmarks
+
+Vectorized environment throughput and end-to-end training FPS scale efficiently with pure MLX on Apple Silicon:
+
+```bash
+python utils/bench.py
+```
+
+| Envs | Env FPS | Train FPS | MLX Peak (MB) | RSS (MB) | Swap (MB) | Status |
+| ---: | ------: | --------: | ------------: | -------: | --------: | :----- |
+| 1 | 192.2 | 146.3 | 91.73 | 117.31 | 0.00 | scaling |
+| 2 | 2,933.8 | 764.6 | 181.34 | 120.64 | 0.00 | scaling |
+| 4 | 6,249.9 | 1,385.3 | 270.26 | 123.30 | 0.00 | scaling |
+| 8 | 11,462.1 | 2,631.1 | 359.06 | 126.22 | 0.00 | scaling |
+| 16 | 23,057.5 | 4,710.4 | 355.09 | 126.84 | 0.00 | scaling |
+| 32 | 46,755.6 | 8,112.6 | 181.48 | 127.72 | 0.00 | scaling |
+| 64 | 102,333.8 | 11,926.4 | 270.62 | 129.06 | 0.00 | scaling |
+| 128 | 200,262.8 | 18,818.1 | 359.98 | 138.47 | 0.00 | scaling |
+| 256 | 365,683.8 | 23,701.9 | 448.70 | 153.95 | 0.00 | scaling |
+| 512 | 719,534.4 | 26,965.2 | 183.26 | 179.33 | 0.00 | scaling |
+| 1024 | 1,401,314.4 | 28,455.8 | 186.84 | 246.56 | 0.00 | scaling |
+| 2048 | 2,634,987.3 | 27,732.7 | 281.98 | 380.84 | 0.00 | plateau (1/2) |
+| 4096 | 4,138,539.0 | 27,675.5 | 206.15 | 643.06 | 0.00 | plateau (2/2) |
+
+- **Peak Env Step Throughput:** `4.14M+ FPS` at `num_envs=4096`
+- **Peak Training Throughput:** `28,455.8 FPS` at `num_envs=1024`
+- **Memory Footprint:** Peak RSS < 650 MB, 0 MB swap utilized across 4096 parallel environments
+
 ## Tests
 
 ```bash

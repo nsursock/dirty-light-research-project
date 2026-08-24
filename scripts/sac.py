@@ -156,6 +156,39 @@ class SAC:
         self.logger = CSVLogger(csv_p, fieldnames=SAC_METRICS_HEADER)
         self.num_timesteps = 0
         self.start_time = time.time()
+        self._init_compiled_updates()
+
+    def _init_compiled_updates(self):
+        def critic_loss(model, obs, act, tgt):
+            q1, q2 = model(obs, act)
+            return 0.5 * mx.mean((q1 - tgt) ** 2) + 0.5 * mx.mean((q2 - tgt) ** 2)
+
+        def actor_loss(model, critic, obs, alpha):
+            a, lp = model.sample(obs)
+            q1, q2 = critic(obs, a)
+            return mx.mean(alpha * lp - mx.minimum(q1, q2)), lp
+
+        critic_vg = nn.value_and_grad(self.critic, critic_loss)
+        actor_vg = nn.value_and_grad(self.actor, actor_loss)
+
+        def critic_update(obs, act, tgt):
+            loss, grads = critic_vg(self.critic, obs, act, tgt)
+            if self.max_grad_norm > 0:
+                grads, _ = opt.clip_grad_norm(grads, self.max_grad_norm)
+            self.critic_opt.update(self.critic, grads)
+            return loss
+
+        def actor_update(obs, alpha):
+            (loss, lp), grads = actor_vg(self.actor, self.critic, obs, alpha)
+            if self.max_grad_norm > 0:
+                grads, _ = opt.clip_grad_norm(grads, self.max_grad_norm)
+            self.actor_opt.update(self.actor, grads)
+            return loss, lp
+
+        c_state = [self.critic.state, self.critic_opt.state]
+        a_state = [self.actor.state, self.critic.state, self.actor_opt.state]
+        self._compiled_critic = mx.compile(critic_update, inputs=c_state, outputs=c_state)
+        self._compiled_actor = mx.compile(actor_update, inputs=a_state, outputs=a_state)
 
     @property
     def alpha(self):
@@ -175,7 +208,7 @@ class SAC:
         b = obs.shape[0] if obs.ndim > 1 else 1
         self.num_timesteps += b
 
-    def train_step(self):
+    def train_step(self, sync: bool = True):
         b_obs, b_act, b_rew, b_next_obs, b_done = self.replay_buffer.sample(self.batch_size)
 
         # 1. Target Q
@@ -183,28 +216,11 @@ class SAC:
         t_q1, t_q2 = self.target_critic(b_next_obs, next_act)
         target_q = b_rew + self.gamma * (1.0 - b_done) * (mx.minimum(t_q1, t_q2) - self.alpha * next_lp)
 
-        # 2. Critic Update
-        def critic_loss(model, obs, act, tgt):
-            q1, q2 = model(obs, act)
-            return 0.5 * mx.mean((q1 - tgt) ** 2) + 0.5 * mx.mean((q2 - tgt) ** 2)
+        # 2. Critic & Actor Updates
+        c_loss = self._compiled_critic(b_obs, b_act, target_q)
+        a_loss, lp = self._compiled_actor(b_obs, self.alpha)
 
-        c_loss, c_grads = nn.value_and_grad(self.critic, critic_loss)(self.critic, b_obs, b_act, target_q)
-        if self.max_grad_norm > 0:
-            c_grads, _ = opt.clip_grad_norm(c_grads, self.max_grad_norm)
-        self.critic_opt.update(self.critic, c_grads)
-
-        # 3. Actor Update
-        def actor_loss(model, critic, obs, alpha):
-            a, lp = model.sample(obs)
-            q1, q2 = critic(obs, a)
-            return mx.mean(alpha * lp - mx.minimum(q1, q2)), lp
-
-        (a_loss, lp), a_grads = nn.value_and_grad(self.actor, actor_loss)(self.actor, self.critic, b_obs, self.alpha)
-        if self.max_grad_norm > 0:
-            a_grads, _ = opt.clip_grad_norm(a_grads, self.max_grad_norm)
-        self.actor_opt.update(self.actor, a_grads)
-
-        # 4. Entropy Temperature Update
+        # 3. Entropy Temperature Update
         ent_loss_val = 0.0
         if self.auto_entropy:
             lp_stop = mx.stop_gradient(lp)
@@ -212,7 +228,7 @@ class SAC:
             self.log_ent_coef = mx.clip(self.log_ent_coef - self.learning_rate * alpha_grad, -5.0, 5.0)
             ent_loss_val = float((-self.log_ent_coef * (lp_stop + self.target_entropy)).mean().item())
 
-        # 5. Target Network Polyak Update
+        # 4. Target Network Polyak Update
         new_target = tree_map(
             lambda tp, p: (1.0 - self.tau) * tp + self.tau * p,
             self.target_critic.parameters(),
@@ -220,8 +236,9 @@ class SAC:
         )
         self.target_critic.update(new_target)
 
-        mx.eval(self.actor.state, self.critic.state, self.target_critic.state, self.log_ent_coef)
-        return a_loss.item(), c_loss.item(), self.alpha.item(), ent_loss_val
+        if sync:
+            mx.eval(self.actor.state, self.critic.state, self.target_critic.state, self.log_ent_coef)
+        return a_loss, c_loss, self.alpha, ent_loss_val
 
     def train(self, gradient_steps=None, ep_rew_mean=0.0, ep_len_mean=0.0):
         if self.replay_buffer.size < self.learning_starts:
@@ -231,11 +248,13 @@ class SAC:
         a_losses, c_losses, alphas, ent_losses = [], [], [], []
 
         for _ in range(steps):
-            al, cl, alpha_v, el = self.train_step()
+            al, cl, alpha_v, el = self.train_step(sync=False)
             a_losses.append(al)
             c_losses.append(cl)
             alphas.append(alpha_v)
             ent_losses.append(el)
+
+        mx.eval(self.actor.state, self.critic.state, self.target_critic.state, self.log_ent_coef, a_losses[-1], c_losses[-1])
 
         elapsed = time.time() - self.start_time
         fps = int(self.num_timesteps / max(elapsed, 1e-6))
@@ -244,9 +263,9 @@ class SAC:
             "time/fps": fps,
             "time/time_elapsed": elapsed,
             "train/learning_rate": self.learning_rate,
-            "train/actor_loss": float(sum(a_losses) / len(a_losses)),
-            "train/critic_loss": float(sum(c_losses) / len(c_losses)),
-            "train/ent_coef": float(sum(alphas) / len(alphas)),
+            "train/actor_loss": float(mx.mean(mx.stack(a_losses)).item()),
+            "train/critic_loss": float(mx.mean(mx.stack(c_losses)).item()),
+            "train/ent_coef": float(mx.mean(mx.stack(alphas)).item()),
             "train/ent_coef_loss": float(sum(ent_losses) / len(ent_losses)),
             "rollout/ep_rew_mean": float(ep_rew_mean),
             "rollout/ep_len_mean": float(ep_len_mean),
