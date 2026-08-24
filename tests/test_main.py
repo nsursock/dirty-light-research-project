@@ -250,3 +250,63 @@ def test_statistically_significant_agent_csv_logging(tmp_path):
         assert len(sac_rows) >= 50, f"SAC rows ({len(sac_rows)}) should reflect high frequency worker steps"
         assert all("train/critic_loss" in r for r in sac_rows)
 
+
+def test_custom_config_cli(monkeypatch, tmp_path):
+    """Verifies that --config correctly loads custom base configuration."""
+    custom_cfg_path = tmp_path / "custom_config.yaml"
+    custom_cfg_content = """
+data:
+  num_candles: 40
+  num_symbols: 2
+  features: ["open", "high", "low", "close", "volume", "funding", "regime", "log_ret", "sma20", "ema12", "ema26", "rsi14", "macd", "macd_sig", "macd_hist", "bb_upper", "bb_lower", "bb_pct", "atr14"]
+  indicators:
+    sma_window: 20
+    ema_fast: 12
+    ema_slow: 26
+    macd_signal: 9
+    rsi_window: 14
+    bb_window: 20
+    bb_k: 2.0
+    atr_window: 14
+  regimes:
+    names: ["Bull", "Bear", "Range", "Crash", "Mania"]
+    mu: [0.0005, -0.0005, 0.0, -0.003, 0.003]
+    sigma: [0.015, 0.025, 0.008, 0.060, 0.045]
+    funding_mu: [0.0003, -0.0002, 0.00005, -0.001, 0.0015]
+    transition_matrix:
+      - [0.97, 0.01, 0.01, 0.005, 0.005]
+      - [0.01, 0.97, 0.01, 0.010, 0.000]
+      - [0.02, 0.02, 0.95, 0.005, 0.005]
+      - [0.05, 0.05, 0.05, 0.850, 0.000]
+      - [0.02, 0.05, 0.03, 0.050, 0.850]
+  ou:
+    theta_f: 0.1
+    sigma_f: 0.0005
+simulation:
+  high_tf: "1h"
+  low_tf: "5m"
+  macro_period: 12
+  num_candles: 40
+  num_symbols: 2
+env:
+  margin_mode: "cross"
+  initial_capital: 5000.0
+"""
+    custom_cfg_path.write_text(custom_cfg_content, encoding="utf-8")
+    run_dir = tmp_path / "custom_run"
+
+    test_args = [
+        "main.py",
+        "--config", str(custom_cfg_path),
+        "--timesteps", "20",
+        "--episodes", "1",
+        "--num_envs", "1",
+        "--log_dir", str(run_dir),
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+    main()
+
+    assert (run_dir / "trade_history.csv").exists()
+    assert (run_dir / "breakdown.txt").exists()
+
+

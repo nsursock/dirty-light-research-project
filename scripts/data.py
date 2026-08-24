@@ -194,7 +194,7 @@ def generate_multi_tf_data(
     """Generates synchronized low-TF and high-TF multi-crypto market tensors in pure MLX."""
     c = config or cfg
     num_candles = num_candles if num_candles is not None else getattr(c.simulation, "num_candles", 600)
-    num_symbols = num_symbols if num_symbols is not None else getattr(c.simulation, "num_symbols", 4)
+    num_symbols = num_symbols if num_symbols is not None else getattr(c.simulation, "num_symbols", 5)
     ratio = get_timeframe_ratio(high_tf, low_tf)
 
     low_tf_data = generate_crypto_data(
@@ -208,7 +208,7 @@ def generate_multi_tf_data(
 
 
 if __name__ == "__main__":
-    low_data, high_data, r = generate_multi_tf_data(num_candles=600, num_symbols=4, high_tf="1h", low_tf="5m")
+    low_data, high_data, r = generate_multi_tf_data(num_candles=600, num_symbols=5, high_tf="1h", low_tf="5m")
     mx.eval(low_data, high_data)
     print(f"Low TF (5m) shape: {low_data.shape} | High TF (1h, ratio {r}) shape: {high_data.shape}")
 

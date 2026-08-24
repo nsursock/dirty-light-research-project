@@ -1,7 +1,7 @@
 # Multi Crypto Trading Bot Configuration
 
 data:
-  num_candles: 1000
+  num_candles: 600
   num_symbols: 5
   dt: 0.0006944444444444445 # 1 / 1440 (1 minute in days)
   s0: 100.0

@@ -57,8 +57,8 @@ def train_hrl(
     high_tf: str = "1h",
     low_tf: str = "5m",
     macro_period: int | None = None,
-    num_symbols: int = 4,
-    num_candles: int = 300,
+    num_symbols: int = 5,
+    num_candles: int = 600,
     alt_interval: int = 200,
     train_freq: int | None = None,
     log_dir: str | Path | None = None,
@@ -184,7 +184,7 @@ def train_hrl(
 def evaluate_hrl(
     ppo_manager, sac_worker, num_episodes: int = 5, margin_mode: str = "isolated",
     high_tf: str = "1h", low_tf: str = "5m", macro_period: int | None = None,
-    num_symbols: int = 4, num_candles: int = 300, eval_envs: int | None = None,
+    num_symbols: int = 5, num_candles: int = 600, eval_envs: int | None = None,
     log_dir: str | Path | None = None, theme: str | None = None,
 ):
     """Vectorized fast evaluation of trained agents across parallel test episodes."""
@@ -291,8 +291,8 @@ def evaluate_hrl(
 
 
 def parse_args():
-    s = cfg.simulation
     p = argparse.ArgumentParser(description="Multi Crypto Pure MLX Trading Bot")
+    p.add_argument("--config", "-c", default=None, help="Path to base configuration YAML file")
     p.add_argument("--mode", choices=["train", "test", "full"], default="full")
     p.add_argument("--stage", default=None, help="S0/S1/S2/S3 or stage YAML path (budget only)")
     p.add_argument("--timesteps", "-t", type=int, default=None)
@@ -300,12 +300,12 @@ def parse_args():
     p.add_argument("--num_envs", "-n", type=int, default=None)
     p.add_argument("--eval_envs", type=int, default=None, help="Parallel evaluation envs")
     p.add_argument("--train_scheme", choices=["joint", "alternating"], default="joint")
-    p.add_argument("--margin_mode", choices=["isolated", "cross"], default=cfg.env.margin_mode)
-    p.add_argument("--high_tf", default=s.high_tf)
-    p.add_argument("--low_tf", default=s.low_tf)
-    p.add_argument("--num_symbols", type=int, default=s.num_symbols)
-    p.add_argument("--num_candles", type=int, default=s.num_candles)
-    p.add_argument("--macro_period", type=int, default=s.get("macro_period"))
+    p.add_argument("--margin_mode", choices=["isolated", "cross"], default=None)
+    p.add_argument("--high_tf", default=None)
+    p.add_argument("--low_tf", default=None)
+    p.add_argument("--num_symbols", type=int, default=None)
+    p.add_argument("--num_candles", type=int, default=None)
+    p.add_argument("--macro_period", type=int, default=None)
     p.add_argument("--train_freq", type=int, default=None)
     p.add_argument("--log_dir", default=None)
     p.add_argument("--theme", choices=["synthwave", "ghibli", "random"], default=None)
@@ -314,7 +314,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    run_cfg = load_config(stage=args.stage) if args.stage else cfg
+    run_cfg = load_config(config_path=args.config, stage=args.stage)
+    s = run_cfg.get("simulation") or {}
+    e = run_cfg.get("env") or {}
     tr, ev = run_cfg.get("training") or {}, run_cfg.get("evaluation") or {}
     timesteps = args.timesteps if args.timesteps is not None else int(tr.get("total_timesteps", 2000))
     num_envs = args.num_envs if args.num_envs is not None else int(tr.get("n_envs", 2))
@@ -324,14 +326,22 @@ def main():
     log_dir = Path(args.log_dir) if args.log_dir else create_run_dir(base_dir="logs")
     print(f"Diet research please... stage={stage_name} | t={timesteps} n_envs={num_envs} eval_eps={episodes} | log={log_dir} | theme={theme}")
     ppo_manager, sac_worker = None, None
-    kw = dict(margin_mode=args.margin_mode, high_tf=args.high_tf, low_tf=args.low_tf, macro_period=args.macro_period, num_symbols=args.num_symbols, num_candles=args.num_candles)
+    high_tf = args.high_tf or s.get("high_tf", "1h")
+    low_tf = args.low_tf or s.get("low_tf", "5m")
+    num_symbols = args.num_symbols if args.num_symbols is not None else s.get("num_symbols", 5)
+    num_candles = args.num_candles if args.num_candles is not None else s.get("num_candles", 600)
+    macro_period = args.macro_period or s.get("macro_period")
+    margin_mode = args.margin_mode or e.get("margin_mode", "isolated")
+    init_cap = float(e.get("initial_capital", 10000.0))
+
+    kw = dict(margin_mode=margin_mode, high_tf=high_tf, low_tf=low_tf, macro_period=macro_period, num_symbols=num_symbols, num_candles=num_candles)
 
     if args.mode in ("train", "full"):
         ppo_manager, sac_worker = train_hrl(total_timesteps=timesteps, num_envs=num_envs, train_scheme=args.train_scheme, train_freq=args.train_freq, log_dir=log_dir, **kw)
     if args.mode in ("test", "full"):
         if ppo_manager is None or sac_worker is None:
-            env0 = MultiCryptoDexPerpEnv(num_symbols=args.num_symbols, num_candles=args.num_candles, high_tf=args.high_tf, low_tf=args.low_tf)
-            ppo_manager, sac_worker = create_agents(env0.obs_dim, args.num_symbols)
+            env0 = MultiCryptoDexPerpEnv(num_symbols=num_symbols, num_candles=num_candles, high_tf=high_tf, low_tf=low_tf, margin_mode=margin_mode, config=run_cfg)
+            ppo_manager, sac_worker = create_agents(env0.obs_dim, num_symbols)
         evaluate_hrl(ppo_manager, sac_worker, num_episodes=episodes, eval_envs=args.eval_envs, log_dir=log_dir, theme=theme, **kw)
 
     TradeHistoryLogger(log_dir / "trade_history.csv")
@@ -339,7 +349,7 @@ def main():
         (log_dir / fname).touch(exist_ok=True)
     th = log_dir / "trade_history.csv"
     generate_breakdown_report(th, log_dir / "breakdown.txt")
-    generate_trade_figures(th, out_dir=log_dir, theme=theme, initial_capital=cfg.env.initial_capital)
+    generate_trade_figures(th, out_dir=log_dir, theme=theme, initial_capital=init_cap)
 
 
 if __name__ == "__main__":

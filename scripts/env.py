@@ -36,7 +36,7 @@ class MultiCryptoDexPerpEnv:
         c = config or cfg
         env_cfg, sim_cfg = getattr(c, "env", {}), getattr(c, "simulation", {})
         self.num_envs = max(1, int(num_envs))
-        self.num_symbols = num_symbols if num_symbols is not None else getattr(c.data, "num_symbols", 4)
+        self.num_symbols = num_symbols if num_symbols is not None else getattr(c.data, "num_symbols", 5)
         self.num_candles = num_candles if num_candles is not None else getattr(c.data, "num_candles", 600)
         self.high_tf = high_tf if high_tf is not None else getattr(sim_cfg, "high_tf", "1h")
         self.low_tf = low_tf if low_tf is not None else getattr(sim_cfg, "low_tf", "5m")
