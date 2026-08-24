@@ -1,0 +1,119 @@
+# Multi Crypto Trading Bot Configuration
+
+data:
+  num_candles: 1000
+  num_symbols: 5
+  dt: 0.0006944444444444445 # 1 / 1440 (1 minute in days)
+  s0: 100.0
+  volume_mean: 10.0
+  volume_std: 0.5
+  high_tf: "1h" # High timeframe for PPO Manager (e.g. 1h, 4h, 1d)
+  low_tf: "5m"  # Low timeframe for SAC Worker (e.g. 1m, 5m, 15m)
+  binance:
+    spot_endpoint: "https://api.binance.com/api/v3/klines"
+    futures_endpoint: "https://fapi.binance.com/fapi/v1/klines"
+    timeframes: ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"]
+  regimes:
+    names: ["Bull", "Bear", "Range", "Crash", "Mania"]
+    mu: [0.0005, -0.0005, 0.0, -0.003, 0.003]
+    sigma: [0.015, 0.025, 0.008, 0.060, 0.045]
+    funding_mu: [0.0003, -0.0002, 0.00005, -0.001, 0.0015]
+    transition_matrix:
+      - [0.97, 0.01, 0.01, 0.005, 0.005]
+      - [0.01, 0.97, 0.01, 0.010, 0.000]
+      - [0.02, 0.02, 0.95, 0.005, 0.005]
+      - [0.05, 0.05, 0.05, 0.850, 0.000]
+      - [0.02, 0.05, 0.03, 0.050, 0.850]
+  ou:
+    theta_f: 0.1
+    sigma_f: 0.0005
+  indicators:
+    sma_window: 20
+    ema_fast: 12
+    ema_slow: 26
+    macd_signal: 9
+    rsi_window: 14
+    bb_window: 20
+    bb_k: 2.0
+    atr_window: 14
+  features:
+    - "open"
+    - "high"
+    - "low"
+    - "close"
+    - "volume"
+    - "funding"
+    - "regime"
+    - "log_ret"
+    - "sma20"
+    - "ema12"
+    - "ema26"
+    - "rsi14"
+    - "macd"
+    - "macd_sig"
+    - "macd_hist"
+    - "bb_upper"
+    - "bb_lower"
+    - "bb_pct"
+    - "atr14"
+
+agents:
+  ppo:
+    hidden_dim: 64
+    learning_rate: 0.0003
+    n_steps: 32
+    batch_size: 16
+    n_epochs: 5
+    gamma: 0.99
+    gae_lambda: 0.95
+    clip_range: 0.2
+    ent_coef: 0.0
+    vf_coef: 0.5
+    max_grad_norm: 0.5
+    csv_path: "ppo_manager.csv"
+  sac:
+    hidden_dim: 128
+    learning_rate: 0.0003
+    buffer_size: 100000
+    learning_starts: 64
+    batch_size: 64
+    tau: 0.005
+    gamma: 0.99
+    train_freq: 1
+    gradient_steps: 1
+    ent_coef: "auto"
+    target_entropy: "auto"
+    max_grad_norm: 1.0
+    csv_path: "sac_worker.csv"
+
+simulation:
+  high_tf: "1h"
+  low_tf: "5m"
+  macro_period: 12
+  num_candles: 600
+  num_symbols: 4
+  done_interval: 100
+
+env:
+  margin_mode: "isolated" # "isolated" (default) or "cross"
+  initial_capital: 10000.0
+  min_leverage: 2.0
+  max_leverage: 150.0
+  min_risk_per_trade: 0.01 # 1%
+  max_risk_per_trade: 0.05 # 5%
+  min_collateral: 10.0 # collateral = risk * balance
+  max_collateral: 1000.0
+  max_open_pos_per_symbol: 1
+  fee_rate: 0.0006
+  slippage_coef: 0.0001
+  maintenance_margin_rate: null # dynamic per leverage: 1 / (2 * leverage) if null
+  liquidation_penalty: 0.01
+  martin_penalty_weight: 5.0
+  bankruptcy_threshold: 1e-4
+  take_profit_pct: 0.04 # dynamic leverage-aware TP (e.g. 0.04 = 4%)
+  stop_loss_pct: 0.02   # dynamic leverage-aware SL (e.g. 0.02 = 2%)
+
+visualization:
+  default_theme: "synthwave"
+  width: 1600
+  height: 1100
